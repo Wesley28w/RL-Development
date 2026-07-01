@@ -399,6 +399,28 @@ class FrankaCabinetEnv(DirectRLEnv):
                         start + count
                     ) % self.cfg.success_buffer_size
 
+        # for logging
+        if hasattr(self, "extras") and "log" in self.extras:
+            times = self.progression[:, :, 0]
+            completed = times < self.max_episode_length
+            highest = completed.sum(dim=1)
+
+            L = self.extras["log"]
+            L["subtasks/sr_subtask_one"] = completions[:, 0].float().mean().item() # success rate
+            L["subtasks/sr_subtask_two"] = completions[:, 1].float().mean().item() # success rate
+            L["subtasks/sr_subtask_three"] = completions[:, 2].float().mean().item() # success rate
+            L["subtasks/sr_subtask_four"] = completions[:, 3].float().mean().item() # success rate
+            L["subtasks/sr_subtask_five"] = completions[:, 4].float().mean().item() # success rate
+            L["curriculum/highest_subtask"] = highest.float().mean().item() # the task with the highest completion rate
+            # the time completion average for each subtask
+            for i in range(5):
+                if completed[:, i].any():
+                    L[f"subtasks/time_subtask_{i+1}"] = (
+                        times[completed[:, i], i].mean() /
+                        self.max_episode_length
+                    ).item()
+
+
     def _update_distribution(self):
         times = self.progression[:, :, 0] # [N, 5]
         # average the times for each subtask across all environments
@@ -415,21 +437,26 @@ class FrankaCabinetEnv(DirectRLEnv):
         gaps = gaps.pow(self.cfg.prob_exp) # Hyperparameter prob_exp is the exponential scaler
         self.distribution = gaps.softmax(dim=0) # update
 
+        # for logging
+        if hasattr(self, "extras") and "log" in self.extras:
+            L = self.extras["log"]
+            for i in range(5):
+                L[f"subtasks/distribution_subtask_{i+1}"] = self.distribution[i].item()
+
     def _get_rewards(self) -> torch.Tensor:
         # Refresh the intermediate values after the physics steps
         self._compute_intermediate_values()
 
         # custom curriclum work
-        if self.cfg.reset_state_curriculum_enabled:
-            self._update_progression() # update data each step
-            # uses the updated progressions
-            if self.common_step_counter % 10: # save compute
-                self._update_distribution()
+        self._update_progression() # update data each step
+        # uses the updated progressions
+        if self.common_step_counter % 10 == 0: # save compute
+            self._update_distribution()
 
         robot_left_finger_pos = self._robot.data.body_pos_w[:, self.left_finger_link_idx]
         robot_right_finger_pos = self._robot.data.body_pos_w[:, self.right_finger_link_idx]
 
-        return self._compute_rewards(
+        rewards =  self._compute_rewards(
             self.actions,
             self._cabinet.data.joint_pos,
             self.robot_grasp_pos,
@@ -450,6 +477,11 @@ class FrankaCabinetEnv(DirectRLEnv):
             self.cfg.finger_reward_scale,
             self._robot.data.joint_pos,
         )
+    
+        if hasattr(self, "extras") and "log" in self.extras:
+                L = self.extras["log"]
+                L["reward/total"] = rewards.mean().item()
+        return rewards
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         super()._reset_idx(env_ids)
@@ -489,7 +521,7 @@ class FrankaCabinetEnv(DirectRLEnv):
 
                 # overwrite default reset with curriculum reset
                 robot_joint_pos[picked] = worlds[:, 0:8]
-                cabinet[picked] = worlds[:, 7:11]
+                cabinet[picked] = worlds[:, 8:12]
 
                 # optional domain randomization
                 robot_joint_pos[picked] += sample_uniform(
@@ -499,9 +531,9 @@ class FrankaCabinetEnv(DirectRLEnv):
                     self.device,
                 )
 
-                # reset progression buffer of all environments reset
-                self.progression[env_ids] = 0
-                self.progression[env_ids, :, 0] = self.max_episode_length
+        # reset progression buffer of all environments reset
+        self.progression[env_ids] = 0
+        self.progression[env_ids, :, 0] = self.max_episode_length
 
         # robot reset
         robot_joint_pos = torch.clamp(robot_joint_pos, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
@@ -514,6 +546,17 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         # refresh observations
         self._compute_intermediate_values(env_ids)
+
+        if hasattr(self, "extras") and "log" in self.extras:
+            variance = (robot_joint_pos - self._robot.data.default_joint_pos[env_ids]).pow(2).mean() # mean squared difference
+            distance = torch.norm(robot_joint_pos - self._robot.data.default_joint_pos[env_ids], dim=1) # distance from the actual joint positions
+
+            # logging for variance on reset world
+            L = self.extras["log"]
+            L["curriculum/reset_distance"] = distance.mean().item()
+            L["curriculum/reset_variance"] = variance.item()
+            if self.cfg.reset_state_curriculum_enabled:
+                L["curriculum/sample_rate"] = picked.float().mean().item() # make sure we are sampling correct ratio
 
     def _get_observations(self) -> dict:
         dof_pos_scaled = (
