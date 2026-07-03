@@ -268,14 +268,14 @@ class FrankaCabinetEnv(DirectRLEnv):
         # added variables for curriculum ---
 
         # progression: completion, times, and poses
-        self.progression = torch.zeros([self.num_envs, 5, 13], device=self.device) # 5 for the num_subtasks, 13 for (compelted time, poses)
+        self.progression = torch.zeros([self.num_envs, 5, 14], device=self.device) # 5 for the num_subtasks, 13 for (compelted time, poses)
         self.progression[:, :, 0] = self.max_episode_length # first value of world is now max episode length
 
         # distribution: probabilites for each subtask to sample from
         self.distribution = torch.softmax(torch.ones([5], device=self.device), dim=0) # [0.2, 0.2, 0.2, 0.2, 0.2]
 
         # success buffer
-        self.success_buffer = torch.zeros([5, self.cfg.success_buffer_size, 12], device=self.device) # 5 subtasks, buffer size of 64, and 12 joint attributes to save 
+        self.success_buffer = torch.zeros([5, self.cfg.success_buffer_size, 13], device=self.device) # 5 subtasks, buffer size of 64, and 13 joint attributes to save 
     
         self.pose_buffer_idx = torch.zeros(
             5,
@@ -336,13 +336,13 @@ class FrankaCabinetEnv(DirectRLEnv):
         # return each environments subtask completion in the form of [N, [0/1, 0/1, 0/1, 0/1, 0/1]]
         return torch.stack([sub_task_1, sub_task_2, sub_task_3, sub_task_4, sub_task_5], dim=1)
 
-    # provides functionality to fetch whole environment poses: [N, 12].
-    # Note: We obtain 12 through adding joints for every object. Some situtations will use pos, vel, and quat
+    # provides functionality to fetch whole environment poses: [N, 13].
+    # Note: We obtain 13 through adding joints for every object. Some situtations will use pos, vel, and quat
     def _get_world(self) -> torch.Tensor:
         return torch.cat([
-            self._robot.data.joint_pos, # (8)
+            self._robot.data.joint_pos, # (9)
             self._cabinet.data.joint_pos, # (4)
-        ], dim=1) # (N, 12)
+        ], dim=1) # (N, 13)
     
     def _update_progression(self):
         completions = self._get_subtasks() # which are completed 
@@ -520,8 +520,8 @@ class FrankaCabinetEnv(DirectRLEnv):
                 worlds = self.success_buffer[subtasks, world_ids]
 
                 # overwrite default reset with curriculum reset
-                robot_joint_pos[picked] = worlds[:, 0:8]
-                cabinet[picked] = worlds[:, 8:12]
+                robot_joint_pos[picked] = worlds[:, 0:9]
+                cabinet[picked] = worlds[:, 9:13]
 
                 # optional domain randomization
                 robot_joint_pos[picked] += sample_uniform(
