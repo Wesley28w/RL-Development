@@ -268,17 +268,17 @@ class FrankaCabinetEnv(DirectRLEnv):
         # added variables for curriculum ---
 
         # progression: completion, times, and poses
-        self.progression = torch.zeros([self.num_envs, 5, 14], device=self.device) # 5 for the num_subtasks, 13 for (compelted time, poses)
+        self.progression = torch.zeros([self.num_envs, 4, 14], device=self.device) # 4 for the num_subtasks, 13 for (compelted time, poses)
         self.progression[:, :, 0] = self.max_episode_length # first value of world is now max episode length
 
         # distribution: probabilites for each subtask to sample from
-        self.distribution = torch.softmax(torch.ones([5], device=self.device), dim=0) # [0.2, 0.2, 0.2, 0.2, 0.2]
+        self.distribution = torch.softmax(torch.ones([4], device=self.device), dim=0) # [0.2, 0.2, 0.2, 0.2, 0.2]
 
         # success buffer
-        self.success_buffer = torch.zeros([5, self.cfg.success_buffer_size, 13], device=self.device) # 5 subtasks, buffer size of 64, and 13 joint attributes to save 
+        self.success_buffer = torch.zeros([4, self.cfg.success_buffer_size, 13], device=self.device) # 4 subtasks, buffer size of 64, and 13 joint attributes to save 
     
         self.pose_buffer_idx = torch.zeros(
-            5,
+            4,
             dtype=torch.long,
             device=self.device
         )
@@ -332,21 +332,19 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         return terminated, truncated
 
-    # returns each environment completion of the subtasks [N, 5]
+    # returns each environment completion of the subtasks [N, 4]
     def _get_subtasks(self) -> torch.Tensor:
+        # 30 cm
+        sub_task_1 = torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.2
         # 20 cm
-        sub_task_1 = torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.25
-        # 10 cm
-        sub_task_2 = (torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.15) & sub_task_1 # couple with 1
-        # 5cm (Touch)
-        sub_task_3 = (torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.08) & sub_task_2 # couple with 1 & 2
+        sub_task_2 = (torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.10) & sub_task_1 # couple with 1
         # 20 cm open
-        sub_task_4 = (self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.20) # doesn't need bounding because doesn't always need to touch
+        sub_task_3 = (self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.20) & sub_task_2 # doesn't need bounding because doesn't always need to touch
         # Fully open (40 cm)
-        sub_task_5 = (self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.38) & sub_task_4 # couple with 4
+        sub_task_4 = (self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.38) & sub_task_3 # couple with 3
 
-        # return each environments subtask completion in the form of [N, [0/1, 0/1, 0/1, 0/1, 0/1]]
-        return torch.stack([sub_task_1, sub_task_2, sub_task_3, sub_task_4, sub_task_5], dim=1)
+        # return each environments subtask completion in the form of [N, [0/1, 0/1, 0/1, 0/1]]
+        return torch.stack([sub_task_1, sub_task_2, sub_task_3, sub_task_4], dim=1)
 
     # provides functionality to fetch whole environment poses: [N, 13].
     # Note: We obtain 13 through adding joints for every object. Some situtations will use pos, vel, and quat
@@ -360,7 +358,7 @@ class FrankaCabinetEnv(DirectRLEnv):
         completions = self._get_subtasks() # which are completed 
         world = self._get_world() # get the current poses of all envs
 
-        previous_times = self.progression[:,:,0] # [N, 5]
+        previous_times = self.progression[:,:,0] # [N, 4]
 
         # which haven't been completed until now
         new_completion = (
@@ -377,7 +375,7 @@ class FrankaCabinetEnv(DirectRLEnv):
             previous_times
         )
 
-        world_expanded = world[:,None,:].expand(-1,5,-1)
+        world_expanded = world[:,None,:].expand(-1,4,-1)
         # insert the worlds to where there was a new completion
         self.progression[:,:,1:] = torch.where(
             new_completion[:,:,None],
@@ -391,7 +389,7 @@ class FrankaCabinetEnv(DirectRLEnv):
         if len(completed_envs) > 0:
             completed_worlds = world[completed_envs]
 
-            for task in range(5):
+            for task in range(4):
                 task_mask = completed_tasks == task
 
                 if task_mask.any():
@@ -422,10 +420,9 @@ class FrankaCabinetEnv(DirectRLEnv):
             L["subtasks/sr_subtask_two"] = completions[:, 1].float().mean().item() # success rate
             L["subtasks/sr_subtask_three"] = completions[:, 2].float().mean().item() # success rate
             L["subtasks/sr_subtask_four"] = completions[:, 3].float().mean().item() # success rate
-            L["subtasks/sr_subtask_five"] = completions[:, 4].float().mean().item() # success rate
             L["curriculum/highest_subtask"] = highest.float().mean().item() # the task with the highest completion rate
             # the time completion average for each subtask
-            for i in range(5):
+            for i in range(4):
                 if completed[:, i].any():
                     L[f"subtasks/time_subtask_{i+1}"] = (
                         times[completed[:, i], i].mean() /
@@ -433,13 +430,13 @@ class FrankaCabinetEnv(DirectRLEnv):
                     ).item()
 
     def _update_distribution(self):
-        times = self.progression[:, :, 0] # [N, 5]
+        times = self.progression[:, :, 0] # [N, 4]
         # average the times for each subtask across all environments
-        times_avg = times.mean(dim=0) # [5, 1]
+        times_avg = times.mean(dim=0) # [4, 1]
         # divide by episode length to make uncompleted = 1
-        times_norm = times_avg / self.max_episode_length # [5, 1]
+        times_norm = times_avg / self.max_episode_length # [4, 1]
 
-        # subtract the previous index from itself: [a, b, c, d, e] - [0, a, b, c, d]
+        # subtract the previous index from itself: [a, b, c, d] - [0, a, b, c]
         previous = torch.cat([torch.zeros(1, device=self.device),times_norm[:-1]])
         gaps = times_norm - previous # THIS is the distrubtion
         gaps = torch.clamp(gaps, min=0) # make sure its +
@@ -451,7 +448,7 @@ class FrankaCabinetEnv(DirectRLEnv):
         # for logging
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
-            for i in range(5):
+            for i in range(4):
                 L[f"subtasks/distribution_subtask_{i+1}"] = self.distribution[i].item()
 
     def _get_rewards(self) -> torch.Tensor:
