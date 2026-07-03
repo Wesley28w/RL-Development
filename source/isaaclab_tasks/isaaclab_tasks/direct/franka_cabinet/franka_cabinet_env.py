@@ -316,7 +316,8 @@ class FrankaCabinetEnv(DirectRLEnv):
     # post-physics step calls
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        terminated = self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.39
+        drawer_pos = self._cabinet.data.joint_pos[:, self.drawer_joint_idx]
+        terminated = drawer_pos > 0.39
         truncated = self.episode_length_buf >= self.max_episode_length - 1
 
         done = terminated | truncated
@@ -325,19 +326,20 @@ class FrankaCabinetEnv(DirectRLEnv):
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
 
-            if done.any():
-                L["dones/success_rate"] = terminated[done].float().mean().item()  
-                
+            # 0.0 = closed, 1.0 = fully open (39 cm)
+            success = torch.clamp(drawer_pos / 0.39, 0.0, 1.0)
+            L["dones/success_rate"] = success.mean().item()  
+
         return terminated, truncated
 
     # returns each environment completion of the subtasks [N, 5]
     def _get_subtasks(self) -> torch.Tensor:
         # 20 cm
-        sub_task_1 = torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.20
+        sub_task_1 = torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.25
         # 10 cm
-        sub_task_2 = (torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.10) & sub_task_1 # couple with 1
+        sub_task_2 = (torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.15) & sub_task_1 # couple with 1
         # 5cm (Touch)
-        sub_task_3 = (torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.05) & sub_task_2 # couple with 1 & 2
+        sub_task_3 = (torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.08) & sub_task_2 # couple with 1 & 2
         # 20 cm open
         sub_task_4 = (self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.20) # doesn't need bounding because doesn't always need to touch
         # Fully open (40 cm)
@@ -429,7 +431,6 @@ class FrankaCabinetEnv(DirectRLEnv):
                         times[completed[:, i], i].mean() /
                         self.max_episode_length
                     ).item()
-
 
     def _update_distribution(self):
         times = self.progression[:, :, 0] # [N, 5]
