@@ -318,6 +318,16 @@ class FrankaCabinetEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         terminated = self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.39
         truncated = self.episode_length_buf >= self.max_episode_length - 1
+
+        done = terminated | truncated
+
+        # should log success rate episodically
+        if hasattr(self, "extras") and "log" in self.extras:
+            L = self.extras["log"]
+
+            if done.any():
+                L["dones/success_rate"] = terminated[done].float().mean().item()  
+                
         return terminated, truncated
 
     # returns each environment completion of the subtasks [N, 5]
@@ -326,12 +336,12 @@ class FrankaCabinetEnv(DirectRLEnv):
         sub_task_1 = torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.20
         # 10 cm
         sub_task_2 = (torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.10) & sub_task_1 # couple with 1
-        # 2cm (Touch)
-        sub_task_3 = (torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.02) & sub_task_2 # couple with 1 & 2
+        # 5cm (Touch)
+        sub_task_3 = (torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.05) & sub_task_2 # couple with 1 & 2
         # 20 cm open
         sub_task_4 = (self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.20) # doesn't need bounding because doesn't always need to touch
         # Fully open (40 cm)
-        sub_task_5 = (self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.39) & sub_task_4 # couple with 4
+        sub_task_5 = (self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.38) & sub_task_4 # couple with 4
 
         # return each environments subtask completion in the form of [N, [0/1, 0/1, 0/1, 0/1, 0/1]]
         return torch.stack([sub_task_1, sub_task_2, sub_task_3, sub_task_4, sub_task_5], dim=1)
@@ -450,8 +460,7 @@ class FrankaCabinetEnv(DirectRLEnv):
         # custom curriclum work
         self._update_progression() # update data each step
         # uses the updated progressions
-        if self.common_step_counter % 10 == 0: # save compute
-            self._update_distribution()
+        self._update_distribution()
 
         robot_left_finger_pos = self._robot.data.body_pos_w[:, self.left_finger_link_idx]
         robot_right_finger_pos = self._robot.data.body_pos_w[:, self.right_finger_link_idx]
@@ -550,7 +559,7 @@ class FrankaCabinetEnv(DirectRLEnv):
         if hasattr(self, "extras") and "log" in self.extras:
             variance = (robot_joint_pos - self._robot.data.default_joint_pos[env_ids]).pow(2).mean() # mean squared difference
             distance = torch.norm(robot_joint_pos - self._robot.data.default_joint_pos[env_ids], dim=1) # distance from the actual joint positions
-
+            
             # logging for variance on reset world
             L = self.extras["log"]
             L["curriculum/reset_distance"] = distance.mean().item()
