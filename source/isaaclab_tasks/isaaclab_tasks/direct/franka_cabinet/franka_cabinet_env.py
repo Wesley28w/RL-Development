@@ -668,15 +668,15 @@ class FrankaCabinetEnv(DirectRLEnv):
             - action_penalty_scale * action_penalty
         )
 
-        self.extras["log"] = {
-            "dist_reward": (dist_reward_scale * dist_reward).mean(),
-            "rot_reward": (rot_reward_scale * rot_reward).mean(),
-            "open_reward": (open_reward_scale * open_reward).mean(),
-            "action_penalty": (-action_penalty_scale * action_penalty).mean(),
-            "left_finger_distance_reward": (finger_reward_scale * lfinger_dist).mean(),
-            "right_finger_distance_reward": (finger_reward_scale * rfinger_dist).mean(),
-            "finger_dist_penalty": (finger_reward_scale * finger_dist_penalty).mean(),
-        }
+        if hasattr(self, "extras") and "log" in self.extras:
+            L = self.extras["log"]
+            L["reward/dist_reward"] = (dist_reward_scale * dist_reward).mean().item()
+            L["reward/rot_reward"] = (rot_reward_scale * rot_reward).mean().item()
+            L["reward/open_reward"] = (open_reward_scale * open_reward).mean().item()
+            L["reward/action_penalty"] = (-action_penalty_scale * action_penalty).mean().item()
+            L["reward/left_finger_distance_reward"] = (finger_reward_scale * lfinger_dist).mean().item()
+            L["reward/right_finger_distance_reward"] = (finger_reward_scale * rfinger_dist).mean().item()
+            L["reward/finger_dist_penalty"] = (finger_reward_scale * finger_dist_penalty).mean().item()
 
         # bonus for opening drawer properly
         drawer_pos = cabinet_dof_pos[:, self.drawer_joint_idx]
