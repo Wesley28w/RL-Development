@@ -22,7 +22,6 @@ from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.math import sample_uniform
 
-
 @configclass
 class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     # env
@@ -33,8 +32,8 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     state_space = 0
 
     # reset state curriculum
-    reset_state_curriculum_enabled = False
-
+    reset_state_curriculum_enabled = True
+     
     # simulation
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 120,
@@ -334,14 +333,14 @@ class FrankaCabinetEnv(DirectRLEnv):
 
     # returns each environment completion of the subtasks [N, 4]
     def _get_subtasks(self) -> torch.Tensor:
-        # 30 cm
-        sub_task_1 = torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.2
         # 20 cm
-        sub_task_2 = (torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.10) & sub_task_1 # couple with 1
+        sub_task_1 = torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.2
+        # 10 cm
+        sub_task_2 = (torch.norm(self.robot_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1) < 0.10) # couple with 1
         # 20 cm open
-        sub_task_3 = (self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.20) & sub_task_2 # doesn't need bounding because doesn't always need to touch
+        sub_task_3 = (self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.20) # doesn't need bounding because doesn't always need to touch
         # Fully open (40 cm)
-        sub_task_4 = (self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.38) & sub_task_3 # couple with 3
+        sub_task_4 = (self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.38) # couple with 3
 
         # return each environments subtask completion in the form of [N, [0/1, 0/1, 0/1, 0/1]]
         return torch.stack([sub_task_1, sub_task_2, sub_task_3, sub_task_4], dim=1)
@@ -458,7 +457,8 @@ class FrankaCabinetEnv(DirectRLEnv):
         # custom curriclum work
         self._update_progression() # update data each step
         # uses the updated progressions
-        self._update_distribution()
+        if torch.rand((), device=self.device) < 0.01:
+            self._update_distribution()
 
         robot_left_finger_pos = self._robot.data.body_pos_w[:, self.left_finger_link_idx]
         robot_right_finger_pos = self._robot.data.body_pos_w[:, self.right_finger_link_idx]
@@ -512,7 +512,7 @@ class FrankaCabinetEnv(DirectRLEnv):
                 # sample subtasks
                 subtasks = torch.multinomial(
                     self.distribution,
-                    int(picked.sum().item()),
+                    1, # change value to 0 for reset always to subtask 1, value to 1 for reset always to subtask 2, etc
                     replacement=True,
                 )
 
