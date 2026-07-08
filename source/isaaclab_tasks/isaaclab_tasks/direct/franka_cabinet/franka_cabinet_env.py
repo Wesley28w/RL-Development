@@ -510,10 +510,18 @@ class FrankaCabinetEnv(DirectRLEnv):
 
             if picked.any():
                 # sample subtasks
-                subtasks = torch.multinomial(
-                    self.distribution,
-                    1, # change value to 0 for reset always to subtask 1, value to 1 for reset always to subtask 2, etc
-                    replacement=True,
+
+                # subtasks = torch.multinomial(
+                #     self.distribution,
+                #     int(picked.sum().item()), # change value to 0 for reset always to subtask 1, value to 1 for reset always to subtask 2, etc
+                #     replacement=True,
+                # )
+
+                subtasks = torch.full(
+                    (int(picked.sum().item()),),
+                    2,
+                    device=self.device,
+                    dtype=torch.long,
                 )
 
                 # sample stored worlds
