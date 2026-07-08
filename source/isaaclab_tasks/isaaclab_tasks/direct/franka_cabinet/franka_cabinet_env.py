@@ -282,6 +282,10 @@ class FrankaCabinetEnv(DirectRLEnv):
             device=self.device
         )
 
+        # We only want to compute times using episodes that are not biased by the curriculum
+        self.is_curriculum_episode = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
         self._cabinet = Articulation(self.cfg.cabinet)
@@ -429,7 +433,12 @@ class FrankaCabinetEnv(DirectRLEnv):
                     ).item()
 
     def _update_distribution(self):
-        times = self.progression[:, :, 0] # [N, 4]
+        # mask to remove curriculum episodes from compute
+        mask = ~self.is_curriculum_episode
+        # edge case where every env is curriculum
+        if mask.sum() == 0:
+            return
+        times = self.progression[mask, :, 0] # [N, 4]
         # average the times for each subtask across all environments
         times_avg = times.mean(dim=0) # [4, 1]
         # divide by episode length to make uncompleted = 1
@@ -447,6 +456,7 @@ class FrankaCabinetEnv(DirectRLEnv):
         # for logging
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
+            L["curriculum/natural_fraction"] = mask.float().mean().item()
             for i in range(4):
                 L[f"subtasks/distribution_subtask_{i+1}"] = self.distribution[i].item()
 
@@ -508,21 +518,24 @@ class FrankaCabinetEnv(DirectRLEnv):
         if self.cfg.reset_state_curriculum_enabled:
             picked = torch.rand(len(env_ids), device=self.device) < self.cfg.sampling_ratio
 
+            # update what episodes are actively using the curriculum
+            self.is_curriculum_episode[env_ids] = False
+            self.is_curriculum_episode[env_ids[picked]] = True
+
             if picked.any():
                 # sample subtasks
-
-                # subtasks = torch.multinomial(
-                #     self.distribution,
-                #     int(picked.sum().item()), # change value to 0 for reset always to subtask 1, value to 1 for reset always to subtask 2, etc
-                #     replacement=True,
-                # )
-
-                subtasks = torch.full(
-                    (int(picked.sum().item()),),
-                    2,
-                    device=self.device,
-                    dtype=torch.long,
+                subtasks = torch.multinomial(
+                    self.distribution,
+                    int(picked.sum().item()), # change value to 0 for reset always to subtask 1, value to 1 for reset always to subtask 2, etc
+                    replacement=True,
                 )
+
+                # subtasks = torch.full(
+                #     (int(picked.sum().item()),),
+                #     2,
+                #     device=self.device,
+                #     dtype=torch.long,
+                # )
 
                 # sample stored worlds
                 world_ids = torch.randint(
