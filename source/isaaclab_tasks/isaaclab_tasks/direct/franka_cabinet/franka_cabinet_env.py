@@ -161,7 +161,7 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
 
     # custom hyperparamters
     success_buffer_size = 64
-    prob_exp = 2 # how much we sharpen the probability disturbtion (1 = No sharpening)
+    prob_exp = 1 # how much we sharpen the probability disturbtion (1 = No sharpening)
     sampling_ratio = 0.3 # what fraction of resets go to the sample distrubtion
     curriculum_dr = 0.02 # how much domain randomization to apply to robot joints
 
