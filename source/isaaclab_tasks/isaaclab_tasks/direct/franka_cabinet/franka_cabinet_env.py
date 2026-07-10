@@ -32,7 +32,7 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     state_space = 0
 
     # reset state curriculum
-    reset_state_curriculum_enabled = True
+    reset_state_curriculum_enabled = False # True
      
     # simulation
     sim: SimulationCfg = SimulationCfg(
@@ -161,7 +161,7 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
 
     # custom hyperparamters
     success_buffer_size = 64
-    prob_exp = 1 # how much we sharpen the probability disturbtion (1 = No sharpening)
+    prob_exp = 2 # how much we sharpen the probability disturbtion (1 = No sharpening)
     sampling_ratio = 0.3 # what fraction of resets go to the sample distrubtion
     curriculum_dr = 0.02 # how much domain randomization to apply to robot joints
 
@@ -449,14 +449,21 @@ class FrankaCabinetEnv(DirectRLEnv):
         gaps = times_norm - previous # THIS is the distrubtion
         gaps = torch.clamp(gaps, min=0) # make sure its +
 
-        # sharpen values
-        gaps = gaps.pow(self.cfg.prob_exp) # Hyperparameter prob_exp is the exponential scaler
-        self.distribution = gaps.softmax(dim=0) # update
+        # expontential:
+        # # sharpen values
+        # gaps = gaps.pow(self.cfg.prob_exp) # Hyperparameter prob_exp is the exponential scaler
+        # self.distribution = gaps.softmax(dim=0) # update
+
+        # greedy:
+        winner = gaps.argmax()
+        self.distrubtion = torch.zeros_like(gaps)
+        self.distribution[winner] = 1.0
 
         # for logging
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
             L["curriculum/natural_fraction"] = mask.float().mean().item()
+            L["curriculum/selected_subtask"] = winner.item()
             for i in range(4):
                 L[f"subtasks/distribution_subtask_{i+1}"] = self.distribution[i].item()
 
