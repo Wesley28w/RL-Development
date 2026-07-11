@@ -162,8 +162,9 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     # custom hyperparamters
     success_buffer_size = 64
     prob_exp = 2 # how much we sharpen the probability disturbtion (1 = No sharpening)
-    sampling_ratio = 0.3 # what fraction of resets go to the sample distrubtion
+    sampling_ratio = 0.3 # what fraction of resets go to the sample distribution
     curriculum_dr = 0.02 # how much domain randomization to apply to robot joints
+    distribution_lr = 0.1 # momentum control
 
 class FrankaCabinetEnv(DirectRLEnv):
     # pre-physics step calls
@@ -446,7 +447,7 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         # subtract the previous index from itself: [a, b, c, d] - [0, a, b, c]
         previous = torch.cat([torch.zeros(1, device=self.device),times_norm[:-1]])
-        gaps = times_norm - previous # THIS is the distrubtion
+        gaps = times_norm - previous # THIS is the distribution 
         gaps = torch.clamp(gaps, min=0) # make sure its +
 
         # expontential:
@@ -456,7 +457,7 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         # greedy:
         winner = gaps.argmax()
-        self.distrubtion = torch.zeros_like(gaps)
+        self.distribution = torch.zeros_like(gaps)
         self.distribution[winner] = 1.0
 
         # for logging
