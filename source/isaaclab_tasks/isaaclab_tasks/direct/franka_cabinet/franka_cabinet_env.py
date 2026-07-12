@@ -167,6 +167,9 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     distribution_lr = 0.1 # momentum control
     greedy_margin = 0.10 # controls the margin between top and second distrubiton value that enables softmax
 
+    # policy params
+    curriculum_total_iterations = 2500
+
 class FrankaCabinetEnv(DirectRLEnv):
     # pre-physics step calls
     #   |-- _pre_physics_step(action)
@@ -451,43 +454,63 @@ class FrankaCabinetEnv(DirectRLEnv):
         gaps = times_norm - previous # THIS is the distribution 
         gaps = torch.clamp(gaps, min=0) # make sure its +
 
-        confidence = gaps / gaps.sum().clamp(min=1e-8) # linear norm for all subtask completion case
+        progress = self.common_step_counter / self.cfg.curriculum_total_iterations * 16
+        progress = min(progress, 1.0)
 
-        # expontential:
-        # # sharpen values
-        # gaps = gaps.pow(self.cfg.prob_exp) # Hyperparameter prob_exp is the exponential scaler
-        # self.distribution = gaps.softmax(dim=0) # update
+        # first 20% of training use softmax
+        if progress < 0.20:
+            self.distribution = gaps.pow(
+                self.cfg.prob_exp
+            ).softmax(dim=0)
 
-        # greedy:
-        # winner = gaps.argmax()
-        # self.distribution = torch.zeros_like(gaps)
-        # self.distribution[winner] = 1.0
+            winner = self.distribution.argmax()
+            largest = self.distribution.max()
+            second = torch.topk(self.distribution, k=2).values[1]
 
-        # adaptive-greedy-exponential (age):
-        top2 = torch.topk(confidence, k=2) # grab the 2 largest
-        winner = top2.indices[0] # index
-        largest = top2.values[0] # value
-        second = top2.values[1] # value
-
-        margin = largest - second # margin determines using expontial probalistic approach or a explicit argmax
-
-        if margin > self.cfg.greedy_margin:
-            # if the bottleneck is clear then be greedy
-            self.distribution = torch.zeros_like(gaps)
-            self.distribution[winner] = 1.0 # results in: [0.0, 0.0, 0.0, 1.0]
+            margin = largest - second
         else:
-            # if the distrubtion is sparse then use probabilities
-            self.distribution = gaps.pow(self.cfg.prob_exp).softmax(dim=0)
+            confidence = gaps / gaps.sum().clamp(min=1e-8) # linear norm for all subtask completion case
+
+            # expontential:
+            # # sharpen values
+            # gaps = gaps.pow(self.cfg.prob_exp) # Hyperparameter prob_exp is the exponential scaler
+            # self.distribution = gaps.softmax(dim=0) # update
+
+            # greedy:
+            # winner = gaps.argmax()
+            # self.distribution = torch.zeros_like(gaps)
+            # self.distribution[winner] = 1.0
+
+            # adaptive-greedy-exponential (age):
+            top2 = torch.topk(confidence, k=2) # grab the 2 largest
+            winner = top2.indices[0] # index
+            largest = top2.values[0] # value
+            second = top2.values[1] # value
+
+            margin = largest - second # margin determines using expontial probalistic approach or a explicit argmax
+
+            if margin > self.cfg.greedy_margin:
+                # if the bottleneck is clear then be greedy
+                self.distribution = torch.zeros_like(gaps)
+                self.distribution[winner] = 1.0 # results in: [0.0, 0.0, 0.0, 1.0]
+            else:
+                # if the distrubtion is sparse then use probabilities
+                self.distribution = gaps.pow(self.cfg.prob_exp).softmax(dim=0)
 
         # for logging
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
+            L["curriculum/training_progress"] = progress
             L["curriculum/natural_fraction"] = mask.float().mean().item()
             L["curriculum/selected_subtask"] = self.distribution.argmax().item()
             L["curriculum/confidence_max"] = largest.item()
             L["curriculum/confidence_second"] = second.item()
             L["curriculum/above_margin"] = (margin>self.cfg.greedy_margin).float().item()
             L["curriculum/margin"] = margin.item()
+            L["curriculum/controller"] = 0 if progress < 0.20 else 1
+            L["curriculum/greedy_active"] = (
+                margin > self.cfg.greedy_margin
+            ).float().item()
             for i in range(4):
                 L[f"subtasks/distribution_subtask_{i+1}"] = self.distribution[i].item()
 
