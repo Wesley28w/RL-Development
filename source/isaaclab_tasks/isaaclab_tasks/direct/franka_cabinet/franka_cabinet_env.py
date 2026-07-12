@@ -165,6 +165,7 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     sampling_ratio = 0.3 # what fraction of resets go to the sample distribution
     curriculum_dr = 0.02 # how much domain randomization to apply to robot joints
     distribution_lr = 0.1 # momentum control
+    greedy_margin = 0.10 # controls the margin between top and second distrubiton value that enables softmax
 
 class FrankaCabinetEnv(DirectRLEnv):
     # pre-physics step calls
@@ -450,21 +451,43 @@ class FrankaCabinetEnv(DirectRLEnv):
         gaps = times_norm - previous # THIS is the distribution 
         gaps = torch.clamp(gaps, min=0) # make sure its +
 
+        confidence = gaps / gaps.sum().clamp(min=1e-8) # linear norm for all subtask completion case
+
         # expontential:
         # # sharpen values
         # gaps = gaps.pow(self.cfg.prob_exp) # Hyperparameter prob_exp is the exponential scaler
         # self.distribution = gaps.softmax(dim=0) # update
 
         # greedy:
-        winner = gaps.argmax()
-        self.distribution = torch.zeros_like(gaps)
-        self.distribution[winner] = 1.0
+        # winner = gaps.argmax()
+        # self.distribution = torch.zeros_like(gaps)
+        # self.distribution[winner] = 1.0
+
+        # adaptive-greedy-exponential (age):
+        top2 = torch.topk(confidence, k=2) # grab the 2 largest
+        winner = top2.indices[0] # index
+        largest = top2.values[0] # value
+        second = top2.values[1] # value
+
+        margin = largest - second # margin determines using expontial probalistic approach or a explicit argmax
+
+        if margin > self.cfg.greedy_margin:
+            # if the bottleneck is clear then be greedy
+            self.distribution = torch.zeros_like(gaps)
+            self.distribution[winner] = 1.0 # results in: [0.0, 0.0, 0.0, 1.0]
+        else:
+            # if the distrubtion is sparse then use probabilities
+            self.distribution = gaps.pow(self.cfg.prob_exp).softmax(dim=0)
 
         # for logging
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
             L["curriculum/natural_fraction"] = mask.float().mean().item()
-            L["curriculum/selected_subtask"] = winner.item()
+            L["curriculum/selected_subtask"] = self.distribution.argmax().item()
+            L["curriculum/confidence_max"] = largest.item()
+            L["curriculum/confidence_second"] = second.item()
+            L["curriculum/above_margin"] = (margin>self.cfg.greedy_margin).float().item()
+            L["curriculum/margin"] = margin.item()
             for i in range(4):
                 L[f"subtasks/distribution_subtask_{i+1}"] = self.distribution[i].item()
 
