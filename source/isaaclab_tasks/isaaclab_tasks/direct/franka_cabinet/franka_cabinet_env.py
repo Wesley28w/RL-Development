@@ -412,8 +412,8 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         # for logging
         if hasattr(self, "extras") and "log" in self.extras:
-            syccess = self.progression[:, :, 0]
-            highest = sucess.sum(dim=1)
+            success = self.progression[:, :, 0]
+            highest = success.sum(dim=1)
 
             L = self.extras["log"]
             for i in range(4):
