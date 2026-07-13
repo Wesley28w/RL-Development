@@ -466,7 +466,7 @@ class FrankaCabinetEnv(DirectRLEnv):
         self.distribution /= self.distribution.sum()
 
         # for logging
-         if hasattr(self, "extras") and "log" in self.extras:
+        if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
             L["curriculum/blend"] = blend.item()
             L["curriculum/margin"] = margin.item()
