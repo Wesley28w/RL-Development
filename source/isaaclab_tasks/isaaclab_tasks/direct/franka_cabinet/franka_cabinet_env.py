@@ -500,10 +500,11 @@ class FrankaCabinetEnv(DirectRLEnv):
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
             L["curriculum/training_progress"] = self.progress
-            L["curriculum/natural_fraction"] = mask.float().mean().item()
             L["curriculum/selected_subtask"] = self.distribution.argmax().item()
             L["curriculum/confidence_max"] = largest.item()
             L["curriculum/confidence_second"] = second.item()
+            L["curriculum/natural_count"] = mask.sum().item() # if ever 0 something is wrong with the is Curriculum Env
+            L["curriculum/curriculum_count"] = self.is_curriculum_episode.sum().item()
             L["curriculum/above_margin"] = (margin>self.cfg.greedy_margin).float().item()
             L["curriculum/margin"] = margin.item()
             L["curriculum/controller"] = 0 if self.progress < 0.20 else 1
@@ -575,7 +576,13 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         # apply curriculum
         if self.cfg.reset_state_curriculum_enabled:
-            picked = torch.rand(len(env_ids), device=self.device) < self.cfg.sampling_ratio
+            # force X% of envrionments to be non curriculum (evals instead)
+            num_curriculum = int(len(env_ids) * self.cfg.sampling_ratio)
+
+            perm = torch.randperm(len(env_ids), device=self.device)
+
+            picked = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
+            picked[perm[:num_curriculum]] = True
 
             # update what episodes are actively using the curriculum
             self.is_curriculum_episode[env_ids] = False
@@ -642,6 +649,7 @@ class FrankaCabinetEnv(DirectRLEnv):
             L = self.extras["log"]
             L["curriculum/reset_distance"] = distance.mean().item()
             L["curriculum/reset_variance"] = variance.item()
+            L["curriculum/nautral_fraction"] = self.is_curriculum_episode.float().mean()
             if self.cfg.reset_state_curriculum_enabled:
                 L["curriculum/sample_rate"] = picked.float().mean().item() # make sure we are sampling correct ratio
 
