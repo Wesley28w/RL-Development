@@ -290,6 +290,8 @@ class FrankaCabinetEnv(DirectRLEnv):
         # We only want to compute times using episodes that are not biased by the curriculum
         self.is_curriculum_episode = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # other
+        self.progress = 0
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
@@ -454,11 +456,8 @@ class FrankaCabinetEnv(DirectRLEnv):
         gaps = times_norm - previous # THIS is the distribution 
         gaps = torch.clamp(gaps, min=0) # make sure its +
 
-        progress = self.common_step_counter / self.cfg.curriculum_total_iterations * 16
-        progress = min(progress, 1.0)
-
         # first 20% of training use softmax
-        if progress < 0.20:
+        if self.progress < 0.20:
             self.distribution = gaps.pow(
                 self.cfg.prob_exp
             ).softmax(dim=0)
@@ -500,14 +499,14 @@ class FrankaCabinetEnv(DirectRLEnv):
         # for logging
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
-            L["curriculum/training_progress"] = progress
+            L["curriculum/training_progress"] = self.progress
             L["curriculum/natural_fraction"] = mask.float().mean().item()
             L["curriculum/selected_subtask"] = self.distribution.argmax().item()
             L["curriculum/confidence_max"] = largest.item()
             L["curriculum/confidence_second"] = second.item()
             L["curriculum/above_margin"] = (margin>self.cfg.greedy_margin).float().item()
             L["curriculum/margin"] = margin.item()
-            L["curriculum/controller"] = 0 if progress < 0.20 else 1
+            L["curriculum/controller"] = 0 if self.progress < 0.20 else 1
             L["curriculum/greedy_active"] = (
                 margin > self.cfg.greedy_margin
             ).float().item()
@@ -518,10 +517,16 @@ class FrankaCabinetEnv(DirectRLEnv):
         # Refresh the intermediate values after the physics steps
         self._compute_intermediate_values()
 
+        # update progress
+        self.progress = min(
+            self.common_step_counter /
+            (self.cfg.curriculum_total_iterations * 16),
+            1.0,
+        )
         # custom curriclum work
         self._update_progression() # update data each step
         # uses the updated progressions
-        if torch.rand((), device=self.device) < 0.01:
+        if torch.rand((), device=self.device) < 0.10:
             self._update_distribution()
 
         robot_left_finger_pos = self._robot.data.body_pos_w[:, self.left_finger_link_idx]
