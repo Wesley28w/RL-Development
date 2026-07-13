@@ -161,11 +161,12 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
 
     # custom hyperparamters
     success_buffer_size = 64
-    prob_exp = 2 # how much we sharpen the probability disturbtion (1 = No sharpening)
+    prob_exp = 2 # how much we sharpen the probability distribution (1 = No sharpening)
     sampling_ratio = 0.3 # what fraction of resets go to the sample distribution
     curriculum_dr = 0.02 # how much domain randomization to apply to robot joints
-    distribution_lr = 0.1 # momentum control
-    greedy_margin = 0.10 # controls the margin between top and second distrubiton value that enables softmax
+    success_rate_alpha = 0.05 # momentum control of success rate movement (pre-calculations)
+    greedy_margin = 0.10 # controls the margin between top and second distribution value that enables softmax
+
 
     # policy params
     curriculum_total_iterations = 2500
@@ -271,12 +272,12 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         # added variables for curriculum ---
 
-        # progression: completion, times, and poses
-        self.progression = torch.zeros([self.num_envs, 4, 14], device=self.device) # 4 for the num_subtasks, 13 for (compelted time, poses)
-        self.progression[:, :, 0] = self.max_episode_length # first value of world is now max episode length
+        # progression: completion, and poses
+        self.progression = torch.zeros([self.num_envs, 4, 14], device=self.device) # 4 for the num_subtasks, 13 for (compelted, poses)
+        self.success_rate = torch.zeros(4, device=self.device) # 4 is number of subtasks
 
         # distribution: probabilites for each subtask to sample from
-        self.distribution = torch.softmax(torch.ones([4], device=self.device), dim=0) # [0.2, 0.2, 0.2, 0.2, 0.2]
+        self.distribution = torch.softmax(torch.ones([4], device=self.device), dim=0) # [0.25, 0.25, 0.25, 0.25]
 
         # success buffer
         self.success_buffer = torch.zeros([4, self.cfg.success_buffer_size, 13], device=self.device) # 4 subtasks, buffer size of 64, and 13 joint attributes to save 
@@ -289,9 +290,6 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         # We only want to compute times using episodes that are not biased by the curriculum
         self.is_curriculum_episode = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-
-        # other
-        self.progress = 0
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
@@ -368,21 +366,14 @@ class FrankaCabinetEnv(DirectRLEnv):
         completions = self._get_subtasks() # which are completed 
         world = self._get_world() # get the current poses of all envs
 
-        previous_times = self.progression[:,:,0] # [N, 4]
-
+        completed_before = self.progression[:,:,0].bool() # [N, 4]
         # which haven't been completed until now
-        new_completion = (
-            completions &
-            (previous_times == self.max_episode_length)
-        )
-        # grab the timestamp of each env
-        current_time = self.episode_length_buf.float()
-
-        # insert the timing where their were new completions only
-        self.progression[:,:,0] = torch.where(
-            new_completion,
-            current_time[:,None],
-            previous_times
+        new_completion = completions & (~completed_before)
+        
+        # store completion forver this episode
+        self.progression[:, :, 0] = torch.maximum(
+            self.progression[:, :, 0],
+            completions.float(),
         )
 
         world_expanded = world[:,None,:].expand(-1,4,-1)
@@ -421,23 +412,13 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         # for logging
         if hasattr(self, "extras") and "log" in self.extras:
-            times = self.progression[:, :, 0]
-            completed = times < self.max_episode_length
-            highest = completed.sum(dim=1)
+            syccess = self.progression[:, :, 0]
+            highest = sucess.sum(dim=1)
 
             L = self.extras["log"]
-            L["subtasks/sr_subtask_one"] = completions[:, 0].float().mean().item() # success rate
-            L["subtasks/sr_subtask_two"] = completions[:, 1].float().mean().item() # success rate
-            L["subtasks/sr_subtask_three"] = completions[:, 2].float().mean().item() # success rate
-            L["subtasks/sr_subtask_four"] = completions[:, 3].float().mean().item() # success rate
-            L["curriculum/highest_subtask"] = highest.float().mean().item() # the task with the highest completion rate
-            # the time completion average for each subtask
             for i in range(4):
-                if completed[:, i].any():
-                    L[f"subtasks/time_subtask_{i+1}"] = (
-                        times[completed[:, i], i].mean() /
-                        self.max_episode_length
-                    ).item()
+                L[f"subtasks/success_{i+1}"] = success[:, i].mean().item()
+            L["curriculum/highest_subtask"] = highest.mean().item()
 
     def _update_distribution(self):
         # mask to remove curriculum episodes from compute
@@ -445,85 +426,59 @@ class FrankaCabinetEnv(DirectRLEnv):
         # edge case where every env is curriculum
         if mask.sum() == 0:
             return
-        times = self.progression[mask, :, 0] # [N, 4]
-        # average the times for each subtask across all environments
-        times_avg = times.mean(dim=0) # [4, 1]
-        # divide by episode length to make uncompleted = 1
-        times_norm = times_avg / self.max_episode_length # [4, 1]
+        
+        batch_success = (self.progression[mask, :, 0].float().mean(dim=0))
 
+        # ema on the success rate to filter noise
+        alpha = self.cfg.success_rate_alpha
+        self.success_rate = ((1.0 - alpha) * self.success_rate + alpha * batch_success)
+
+        # difficulty
+        difficulty = 1.0 - self.success_rate # turns success rate (sr) into failure rate (fr)
         # subtract the previous index from itself: [a, b, c, d] - [0, a, b, c]
-        previous = torch.cat([torch.zeros(1, device=self.device),times_norm[:-1]])
-        gaps = times_norm - previous # THIS is the distribution 
-        gaps = torch.clamp(gaps, min=0) # make sure its +
+        previous = torch.cat([torch.zeros(1, device=self.device), difficulty[:-1]])
+        gaps = difficulty - previous # THIS is the distribution
+        # alternative to clamping because we want to avoid losing info 
+        gaps = gaps - gaps.min() # ensure all values are postitive
+        gaps = gaps + 1e-8 # if all gaps are equal we don't want all 0s so add tiny value
+        
+        # softmax distribution 
+        soft = gaps.pow(
+            self.cfg.prob_exp
+        ).softmax(dim=0)
 
-        # first 20% of training use softmax
-        if self.progress < 0.20:
-            self.distribution = gaps.pow(
-                self.cfg.prob_exp
-            ).softmax(dim=0)
+        # confidence
+        confidence = (
+            gaps / gaps.sum().clamp(min=1e-8) # linear norm
+        )
 
-            winner = self.distribution.argmax()
-            largest = self.distribution.max()
-            second = torch.topk(self.distribution, k=2).values[1]
+        top2 = torch.topk(confidence, k=2)
+        winner = top2.indices[0] # biggest fr
+        margin = (top2.values[0] - top2.values[1]) # difference between biggest and second biggest fr
 
-            margin = largest - second
-        else:
-            confidence = gaps / gaps.sum().clamp(min=1e-8) # linear norm for all subtask completion case
+        # greedy
+        hard = torch.zeros_like(gaps)
+        hard[winner] = 1.0 
 
-            # expontential:
-            # # sharpen values
-            # gaps = gaps.pow(self.cfg.prob_exp) # Hyperparameter prob_exp is the exponential scaler
-            # self.distribution = gaps.softmax(dim=0) # update
-
-            # greedy:
-            # winner = gaps.argmax()
-            # self.distribution = torch.zeros_like(gaps)
-            # self.distribution[winner] = 1.0
-
-            # adaptive-greedy-exponential (age):
-            top2 = torch.topk(confidence, k=2) # grab the 2 largest
-            winner = top2.indices[0] # index
-            largest = top2.values[0] # value
-            second = top2.values[1] # value
-
-            margin = largest - second # margin determines using expontial probalistic approach or a explicit argmax
-
-            if margin > self.cfg.greedy_margin:
-                # if the bottleneck is clear then be greedy
-                self.distribution = torch.zeros_like(gaps)
-                self.distribution[winner] = 1.0 # results in: [0.0, 0.0, 0.0, 1.0]
-            else:
-                # if the distrubtion is sparse then use probabilities
-                self.distribution = gaps.pow(self.cfg.prob_exp).softmax(dim=0)
+        # blend between the two
+        blend = torch.clamp(margin / self.cfg.greedy_margin, 0.0, 1.0) # elegant: if margin is great than 0.1 then it will be clamped to 1.0. 
+        self.distribution = ((1.0 - blend) * soft + blend * hard)
+        self.distribution /= self.distribution.sum()
 
         # for logging
-        if hasattr(self, "extras") and "log" in self.extras:
+         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
-            L["curriculum/training_progress"] = self.progress
-            L["curriculum/selected_subtask"] = self.distribution.argmax().item()
-            L["curriculum/confidence_max"] = largest.item()
-            L["curriculum/confidence_second"] = second.item()
-            L["curriculum/natural_count"] = mask.sum().item() # if ever 0 something is wrong with the is Curriculum Env
-            L["curriculum/curriculum_count"] = self.is_curriculum_episode.sum().item()
-            L["curriculum/above_margin"] = (margin>self.cfg.greedy_margin).float().item()
+            L["curriculum/blend"] = blend.item()
             L["curriculum/margin"] = margin.item()
-            L["curriculum/controller"] = 0 if self.progress < 0.20 else 1
-            L["curriculum/greedy_active"] = (
-                margin > self.cfg.greedy_margin
-            ).float().item()
+            L["curriculum/selected"] = winner.item()
             for i in range(4):
-                L[f"subtasks/distribution_subtask_{i+1}"] = self.distribution[i].item()
+                L[f"curriculum/success_rate_{i+1}"] = (self.success_rate[i].item())
+                L[f"curriculum/difficulty_{i+1}"] = (difficulty[i].item())
+                L[f"curriculum/distribution_{i+1}"] = (self.distribution[i].item())
 
     def _get_rewards(self) -> torch.Tensor:
         # Refresh the intermediate values after the physics steps
         self._compute_intermediate_values()
-
-        # update progress
-        self.progress = min(
-            self.common_step_counter /
-            (self.cfg.curriculum_total_iterations * 16),
-            1.0,
-        )
         # custom curriclum work
         self._update_progression() # update data each step
         # uses the updated progressions
@@ -626,9 +581,8 @@ class FrankaCabinetEnv(DirectRLEnv):
                 )
 
         # reset progression buffer of all environments reset
-        self.progression[env_ids] = 0
-        self.progression[env_ids, :, 0] = self.max_episode_length
-
+        self.progression[env_ids] = 0 # set back to incomplete
+        
         # robot reset
         robot_joint_pos = torch.clamp(robot_joint_pos, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
         joint_vel = torch.zeros_like(robot_joint_pos)
@@ -649,7 +603,7 @@ class FrankaCabinetEnv(DirectRLEnv):
             L = self.extras["log"]
             L["curriculum/reset_distance"] = distance.mean().item()
             L["curriculum/reset_variance"] = variance.item()
-            L["curriculum/nautral_fraction"] = self.is_curriculum_episode.float().mean()
+            L["curriculum/natural"] = self.is_curriculum_episode.float().mean()
             if self.cfg.reset_state_curriculum_enabled:
                 L["curriculum/sample_rate"] = picked.float().mean().item() # make sure we are sampling correct ratio
 
