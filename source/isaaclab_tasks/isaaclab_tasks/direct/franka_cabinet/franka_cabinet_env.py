@@ -170,6 +170,9 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
 
     # policy params
     curriculum_total_iterations = 2500
+    window_analysis_size = 0.1 # percent to look at
+    window_analysis_start = 0.02 # percent to start at
+    slope_threshold = 2.0 # what threshold slope will disable curriculum
 
 class FrankaCabinetEnv(DirectRLEnv):
     # pre-physics step calls
@@ -291,6 +294,14 @@ class FrankaCabinetEnv(DirectRLEnv):
         # We only want to compute times using episodes that are not biased by the curriculum
         self.is_curriculum_episode = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # Controller
+        self.progress = 0.0 # for tracking progression (0.0-1.0)
+        self.curriculum_enabled = self.cfg.reset_state_curriculum_enabled # set to whatever cfg (mutable)
+        self.overall_success = 0.0 # final task success (0.0-1.0)
+        self.controller_snapshot = None
+        self.controller_snapshot_two = None
+        self.controller_checked = False
+
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
         self._cabinet = Articulation(self.cfg.cabinet)
@@ -335,8 +346,8 @@ class FrankaCabinetEnv(DirectRLEnv):
             L = self.extras["log"]
 
             # 0.0 = closed, 1.0 = fully open (39 cm)
-            success = torch.clamp(drawer_pos / 0.39, 0.0, 1.0)
-            L["dones/success_rate"] = success.mean().item()  
+            self.overall_success = torch.clamp(drawer_pos / 0.39, 0.0, 1.0)
+            L["dones/success_rate"] = self.overall_success.mean().item()  
 
         return terminated, truncated
 
@@ -476,9 +487,42 @@ class FrankaCabinetEnv(DirectRLEnv):
                 L[f"curriculum/difficulty_{i+1}"] = (difficulty[i].item())
                 L[f"curriculum/distribution_{i+1}"] = (self.distribution[i].item())
 
+    def _run_curriculum_controller(self):
+        # only run while curriculum is enabled
+        if not self.curriculum_enabled:
+            return
+
+        success = self.overall_success.mean().item() # TODO: switch to ema smoothed success_rate var
+
+        # Take snapshot once
+        if (self.progress >= self.cfg.window_analysis_start and self.controller_snapshot is None):
+            self.controller_snapshot = success
+
+        # Evaluate once
+        if (
+            self.progress >= self.cfg.window_analysis_start + self.cfg.window_analysis_size
+            and not self.controller_checked
+        ):
+            self.controller_checked = True
+            self.controller_snapshot_two = success
+            delta_success = success - self.controller_snapshot
+            slope = (delta_success / self.cfg.window_analysis_size)
+            self.curriculum_enabled = (slope > self.cfg.slope_threshold)
+
     def _get_rewards(self) -> torch.Tensor:
         # Refresh the intermediate values after the physics steps
         self._compute_intermediate_values()
+
+        # update progress
+        self.progress = min(
+            self.common_step_counter /
+            (self.cfg.curriculum_total_iterations * 16),
+            1.0,
+        )
+        # run controller for choosing enable/disable
+        if self.cfg.reset_state_curriculum_enabled:
+            self._run_curriculum_controller()
+
         # custom curriclum work
         self._update_progression() # update data each step
         # uses the updated progressions
@@ -511,8 +555,14 @@ class FrankaCabinetEnv(DirectRLEnv):
         )
     
         if hasattr(self, "extras") and "log" in self.extras:
-                L = self.extras["log"]
-                L["reward/total"] = rewards.mean().item()
+            L = self.extras["log"]
+            L["reward/total"] = rewards.mean().item()
+            L["controller/curriculum_enabled"] = int(self.curriculum_enabled)
+            L["controller/first_snapshot_taken"] = 0 if self.controller_snapshot is None else self.controller_snapshot
+            L["controller/second_snapshot_taken"] = 0 if self.controller_snapshot_two is None else self.controller_snapshot_two
+            if self.controller_checked:
+                L["controller/slope"] = ((self.controller_snapshot_two - self.controller_snapshot) / self.cfg.window_analysis_size)
+
         return rewards
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
@@ -530,7 +580,7 @@ class FrankaCabinetEnv(DirectRLEnv):
         cabinet = torch.zeros((len(env_ids), self._cabinet.num_joints), device=self.device)
 
         # apply curriculum
-        if self.cfg.reset_state_curriculum_enabled:
+        if (self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled):
             # force X% of envrionments to be non curriculum (evals instead)
             num_curriculum = int(len(env_ids) * self.cfg.sampling_ratio)
 
@@ -604,7 +654,7 @@ class FrankaCabinetEnv(DirectRLEnv):
             L["curriculum/reset_distance"] = distance.mean().item()
             L["curriculum/reset_variance"] = variance.item()
             L["curriculum/natural"] = self.is_curriculum_episode.float().mean()
-            if self.cfg.reset_state_curriculum_enabled:
+            if self.curriculum_enabled:
                 L["curriculum/sample_rate"] = picked.float().mean().item() # make sure we are sampling correct ratio
 
     def _get_observations(self) -> dict:
