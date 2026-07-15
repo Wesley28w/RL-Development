@@ -170,8 +170,8 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
 
     # policy params
     curriculum_total_iterations = 2500
-    window_analysis_size = 0.1 # percent to look at
-    window_analysis_start = 0.02 # percent to start at
+    window_analysis_size = 0.01 # percent to look at
+    window_analysis_start = 0.01 # percent to start at
     slope_threshold = 2.0 # what threshold slope will disable curriculum
 
 class FrankaCabinetEnv(DirectRLEnv):
