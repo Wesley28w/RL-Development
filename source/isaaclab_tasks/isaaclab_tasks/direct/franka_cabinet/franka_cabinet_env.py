@@ -162,14 +162,14 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     # custom hyperparamters
     success_buffer_size = 64
     prob_exp = 2 # how much we sharpen the probability distribution (1 = No sharpening)
-    sampling_ratio = 0.1 # what fraction of resets go to the sample distribution
-    curriculum_dr = 0.02 # how much domain randomization to apply to robot joints
+    sampling_ratio = 0.3 # what fraction of resets go to the sample distribution
+    curriculum_dr = 0.00 # how much domain randomization to apply to robot joints
     success_rate_alpha = 0.05 # momentum control of success rate movement (pre-calculations)
     greedy_margin = 0.10 # controls the margin between top and second distribution value that enables softmax
 
-
     # policy params
     curriculum_total_iterations = 2500
+    controller_enabled = False
     window_analysis_size = 0.02 # percent to look at
     window_analysis_start = 0.01 # percent to start at
     slope_threshold = 2.0 # what threshold slope will disable curriculum
@@ -305,7 +305,7 @@ class FrankaCabinetEnv(DirectRLEnv):
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
         self._cabinet = Articulation(self.cfg.cabinet)
-        self.scene.articulations["robot"] = self._robot
+        self.scene.articulations["robot"] = self._robot 
         self.scene.articulations["cabinet"] = self._cabinet
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
@@ -475,6 +475,7 @@ class FrankaCabinetEnv(DirectRLEnv):
         blend = torch.clamp(margin / self.cfg.greedy_margin, 0.0, 1.0) # elegant: if margin is great than 0.1 then it will be clamped to 1.0. 
         self.distribution = ((1.0 - blend) * soft + blend * hard)
         self.distribution /= self.distribution.sum()
+        # self.distribution = soft
 
         # for logging
         if hasattr(self, "extras") and "log" in self.extras:
@@ -486,7 +487,8 @@ class FrankaCabinetEnv(DirectRLEnv):
                 L[f"curriculum/success_rate_{i+1}"] = (self.success_rate[i].item())
                 L[f"curriculum/difficulty_{i+1}"] = (difficulty[i].item())
                 L[f"curriculum/distribution_{i+1}"] = (self.distribution[i].item())
-
+            for i in range(4):
+                L[f"curriculum/gap_{i+1}"] = gaps[i].item()
     def _run_curriculum_controller(self):
         # only run while curriculum is enabled
         if not self.curriculum_enabled:
@@ -520,7 +522,7 @@ class FrankaCabinetEnv(DirectRLEnv):
             1.0,
         )
         # run controller for choosing enable/disable
-        if self.cfg.reset_state_curriculum_enabled:
+        if self.cfg.reset_state_curriculum_enabled and self.cfg.controller_enabled:
             self._run_curriculum_controller()
 
         # custom curriclum work
@@ -582,7 +584,16 @@ class FrankaCabinetEnv(DirectRLEnv):
         # apply curriculum
         if (self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled):
             # force X% of envrionments to be non curriculum (evals instead)
-            num_curriculum = int(len(env_ids) * self.cfg.sampling_ratio)
+            sample_ratio = self.cfg.sampling_ratio
+
+            # if self.progress > 0.9:
+            #     sample_ratio = min(sample_ratio + 0.35, 1.0)
+            # elif self.progress > 0.5:
+            #     sample_ratio = min(sample_ratio + 0.2, 1.0)
+            # elif self.progress < 0.1:
+            #     sample_ratio = 0.0
+            
+            num_curriculum = int(len(env_ids) * sample_ratio)
 
             perm = torch.randperm(len(env_ids), device=self.device)
 
@@ -656,7 +667,7 @@ class FrankaCabinetEnv(DirectRLEnv):
             L["curriculum/natural"] = self.is_curriculum_episode.float().mean()
             if self.curriculum_enabled:
                 L["curriculum/sample_rate"] = picked.float().mean().item() # make sure we are sampling correct ratio
-
+                L["curriculum/sample_ratio_target"] = sample_ratio
     def _get_observations(self) -> dict:
         dof_pos_scaled = (
             2.0
