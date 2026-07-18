@@ -530,8 +530,12 @@ class FrankaCabinetEnv(DirectRLEnv):
         # # custom curriclum work
         self._update_progression() # update data each step
         # uses the updated progressions
-        if self.common_step_counter % self.cfg.update_dis_percent == 0:
-            self._update_distribution()
+        if self.cfg.reset_state_curriculum_enabled:
+            if torch.rand((), device=self.device) < 0.10:
+                self._update_distribution()
+        else: # keep determinisitc by not messing with the rand generator
+            if self.common_step_counter % 10 == 0:
+                self._update_distribution()
 
         robot_left_finger_pos = self._robot.data.body_pos_w[:, self.left_finger_link_idx]
         robot_right_finger_pos = self._robot.data.body_pos_w[:, self.right_finger_link_idx]
