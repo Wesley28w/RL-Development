@@ -32,8 +32,8 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     state_space = 0
 
     # reset state curriculum
-    reset_state_curriculum_enabled = True # True
-     
+    reset_state_curriculum_enabled = False # True
+
     # simulation
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 120,
@@ -166,7 +166,7 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     curriculum_dr = 0.00 # how much domain randomization to apply to robot joints
     success_rate_alpha = 0.05 # momentum control of success rate movement (pre-calculations)
     greedy_margin = 0.10 # controls the margin between top and second distribution value that enables softmax
-
+    update_dis_percent = 10 # update 
     # policy params
     curriculum_total_iterations = 2500
     controller_enabled = False
@@ -489,6 +489,7 @@ class FrankaCabinetEnv(DirectRLEnv):
                 L[f"curriculum/distribution_{i+1}"] = (self.distribution[i].item())
             for i in range(4):
                 L[f"curriculum/gap_{i+1}"] = gaps[i].item()
+    
     def _run_curriculum_controller(self):
         # only run while curriculum is enabled
         if not self.curriculum_enabled:
@@ -525,10 +526,10 @@ class FrankaCabinetEnv(DirectRLEnv):
         if self.cfg.reset_state_curriculum_enabled and self.cfg.controller_enabled:
             self._run_curriculum_controller()
 
-        # custom curriclum work
+        # # custom curriclum work
         self._update_progression() # update data each step
         # uses the updated progressions
-        if torch.rand((), device=self.device) < 0.10:
+        if self.common_step_counter % self.cfg.update_dis_percent == 0:
             self._update_distribution()
 
         robot_left_finger_pos = self._robot.data.body_pos_w[:, self.left_finger_link_idx]
@@ -668,6 +669,7 @@ class FrankaCabinetEnv(DirectRLEnv):
             if self.curriculum_enabled:
                 L["curriculum/sample_rate"] = picked.float().mean().item() # make sure we are sampling correct ratio
                 L["curriculum/sample_ratio_target"] = sample_ratio
+
     def _get_observations(self) -> dict:
         dof_pos_scaled = (
             2.0
