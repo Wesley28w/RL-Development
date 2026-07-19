@@ -446,30 +446,48 @@ class FrankaCabinetEnv(DirectRLEnv):
         self.success_rate = ((1.0 - alpha) * self.success_rate + alpha * batch_success)
 
         # difficulty
-        difficulty = 1.0 - self.success_rate
+        difficulty = 1.0 - self.success_rate # turns success rate (sr) into failure rate (fr)
+        # subtract the previous index from itself: [a, b, c, d] - [0, a, b, c]
+        previous = torch.cat([torch.zeros(1, device=self.device), difficulty[:-1]])
+        gaps = difficulty - previous # THIS is the distribution
+        # alternative to clamping because we want to avoid losing info 
+        gaps = gaps - gaps.min() # ensure all values are postitive
+        gaps = gaps + 1e-8 # if all gaps are equal we don't want all 0s so add tiny value
+        
+        # softmax distribution 
+        soft = gaps.pow(
+            self.cfg.prob_exp
+        ).softmax(dim=0)
 
-        previous = torch.cat([
-            torch.zeros(1, device=self.device),
-            difficulty[:-1]
-        ])
+        # confidence
+        confidence = (
+            gaps / gaps.sum().clamp(min=1e-8) # linear norm
+        )
 
-        gaps = difficulty - previous
-        gaps = gaps - gaps.min()
+        top2 = torch.topk(confidence, k=2)
+        winner = top2.indices[0] # biggest fr
+        margin = (top2.values[0] - top2.values[1]) # difference between biggest and second biggest fr
 
-        winner = torch.argmax(gaps)
+        # greedy
+        hard = torch.zeros_like(gaps)
+        hard[winner] = 1.0 
 
-        self.distribution = torch.zeros_like(gaps)
-        self.distribution[winner] = 1.0
+        # blend between the two
+        blend = torch.clamp(margin / self.cfg.greedy_margin, 0.0, 1.0) # elegant: if margin is great than 0.1 then it will be clamped to 1.0. 
+        self.distribution = ((1.0 - blend) * soft + blend * hard)
+        self.distribution /= self.distribution.sum()
+        # self.distribution = soft
 
         # for logging
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
+            L["curriculum/blend"] = blend.item()
+            L["curriculum/margin"] = margin.item()
             L["curriculum/selected"] = winner.item()
             for i in range(4):
                 L[f"curriculum/success_rate_{i+1}"] = (self.success_rate[i].item())
                 L[f"curriculum/difficulty_{i+1}"] = (difficulty[i].item())
                 L[f"curriculum/distribution_{i+1}"] = (self.distribution[i].item())
-                L["curriculum/winner_gap"] = gaps[winner].item()
             for i in range(4):
                 L[f"curriculum/gap_{i+1}"] = gaps[i].item()
     
@@ -573,6 +591,13 @@ class FrankaCabinetEnv(DirectRLEnv):
         if (self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled):
             # force X% of envrionments to be non curriculum (evals instead)
             sample_ratio = self.cfg.sampling_ratio
+
+            # if self.progress > 0.9:
+            #     sample_ratio = min(sample_ratio + 0.35, 1.0)
+            # elif self.progress > 0.5:
+            #     sample_ratio = min(sample_ratio + 0.2, 1.0)
+            # elif self.progress < 0.1:
+            #     sample_ratio = 0.0
             
             num_curriculum = int(len(env_ids) * sample_ratio)
 
