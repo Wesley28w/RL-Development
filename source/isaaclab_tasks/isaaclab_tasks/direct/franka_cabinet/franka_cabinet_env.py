@@ -277,14 +277,14 @@ class FrankaCabinetEnv(DirectRLEnv):
         # added variables for curriculum ---
 
         # progression: completion, and poses
-        self.progression = torch.zeros([self.num_envs, 4, 27], device=self.device) # 4 for the num_subtasks, 13*2 for (compelted, poses and joints)
+        self.progression = torch.zeros([self.num_envs, 4, 14], device=self.device) # 4 for the num_subtasks, 13 for (compelted, poses)
         self.success_rate = torch.zeros(4, device=self.device) # 4 is number of subtasks
 
         # distribution: probabilites for each subtask to sample from
         self.distribution = torch.softmax(torch.ones([4], device=self.device), dim=0) # [0.25, 0.25, 0.25, 0.25]
 
         # success buffer
-        self.success_buffer = torch.zeros([4, self.cfg.success_buffer_size, 26], device=self.device) # 4 subtasks, buffer size of 64, and 13 joint attributes to save 
+        self.success_buffer = torch.zeros([4, self.cfg.success_buffer_size, 13], device=self.device) # 4 subtasks, buffer size of 64, and 13 joint attributes to save 
     
         self.pose_buffer_idx = torch.zeros(
             4,
@@ -371,9 +371,7 @@ class FrankaCabinetEnv(DirectRLEnv):
     def _get_world(self) -> torch.Tensor:
         return torch.cat([
             self._robot.data.joint_pos, # (9)
-            self._robot.data.joint_vel, # (9)
             self._cabinet.data.joint_pos, # (4)
-            self._cabinet.data.joint_vel # (4)
         ], dim=1) # (N, 13)
     
     def _update_progression(self):
@@ -585,20 +583,9 @@ class FrankaCabinetEnv(DirectRLEnv):
             (len(env_ids), self._robot.num_joints),
             self.device,
         )
-        robot_joint_vel = torch.zeros(
-            (len(env_ids), self._robot.num_joints),
-            device=self.device,
-        )
 
         # cabinet state
-        cabinet_joint_pos = torch.zeros(
-            (len(env_ids), self._cabinet.num_joints),
-            device=self.device
-        )
-        cabinet_joint_vel = torch.zeros(
-            (len(env_ids), self._cabinet.num_joints),
-            device=self.device,
-        )
+        cabinet = torch.zeros((len(env_ids), self._cabinet.num_joints), device=self.device)
 
         # apply curriculum
         if (self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled):
@@ -650,10 +637,7 @@ class FrankaCabinetEnv(DirectRLEnv):
 
                 # overwrite default reset with curriculum reset
                 robot_joint_pos[picked] = worlds[:, 0:9]
-                robot_joint_vel[picked] = worlds[:, 9:18]
-
-                cabinet_joint_pos[picked] = worlds[:, 18:22]
-                cabinet_joint_vel[picked] = worlds[:, 22:26]
+                cabinet[picked] = worlds[:, 9:13]
 
                 # optional domain randomization
                 robot_joint_pos[picked] += sample_uniform(
@@ -666,18 +650,14 @@ class FrankaCabinetEnv(DirectRLEnv):
         # reset progression buffer of all environments reset
         self.progression[env_ids] = 0 # set back to incomplete
         
-        # clamp velocities
-        robot_joint_vel = robot_joint_vel.clamp(-2.0, 2.0)
-        cabinet_joint_vel = cabinet_joint_vel.clamp(-2.0, 2.0)
-
         # robot reset
         robot_joint_pos = torch.clamp(robot_joint_pos, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
+        joint_vel = torch.zeros_like(robot_joint_pos)
         self._robot.set_joint_position_target(robot_joint_pos, env_ids=env_ids)
-        self._robot.write_joint_state_to_sim(robot_joint_pos, robot_joint_vel, env_ids=env_ids)
+        self._robot.write_joint_state_to_sim(robot_joint_pos, joint_vel, env_ids=env_ids)
 
         # cabinet reset
-        self._cabinet.set_joint_position_target(cabinet_joint_pos, env_ids=env_ids)
-        self._cabinet.write_joint_state_to_sim(cabinet_joint_pos, cabinet_joint_vel, env_ids=env_ids)
+        self._cabinet.write_joint_state_to_sim(cabinet, cabinet, env_ids=env_ids)
 
         # refresh observations
         self._compute_intermediate_values(env_ids)
