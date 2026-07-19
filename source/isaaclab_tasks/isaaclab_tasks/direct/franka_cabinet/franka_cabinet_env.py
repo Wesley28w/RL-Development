@@ -592,12 +592,8 @@ class FrankaCabinetEnv(DirectRLEnv):
             # force X% of envrionments to be non curriculum (evals instead)
             sample_ratio = self.cfg.sampling_ratio
 
-            # if self.progress > 0.9:
-            #     sample_ratio = min(sample_ratio + 0.35, 1.0)
-            # elif self.progress > 0.5:
-            #     sample_ratio = min(sample_ratio + 0.2, 1.0)
-            # elif self.progress < 0.1:
-            #     sample_ratio = 0.0
+            if self.progress < 0.1:
+                sample_ratio = 0.0
             
             num_curriculum = int(len(env_ids) * sample_ratio)
 
