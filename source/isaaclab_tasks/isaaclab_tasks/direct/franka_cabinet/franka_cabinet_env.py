@@ -295,6 +295,14 @@ class FrankaCabinetEnv(DirectRLEnv):
         # We only want to compute times using episodes that are not biased by the curriculum
         self.is_curriculum_episode = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # for logging sr of replay environments
+        self.curriculum_subtask = torch.full(
+            (self.num_envs,),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        
         # Controller
         self.progress = 0.0 # for tracking progression (0.0-1.0)
         self.curriculum_enabled = self.cfg.reset_state_curriculum_enabled # set to whatever cfg (mutable)
@@ -422,15 +430,54 @@ class FrankaCabinetEnv(DirectRLEnv):
                         start + count
                     ) % self.cfg.success_buffer_size
 
-        # for logging
         if hasattr(self, "extras") and "log" in self.extras:
+            L = self.extras["log"]
             success = self.progression[:, :, 0]
+            eval_success = torch.zeros([4], dtype=torch.float32)
+            replay_success = torch.zeros([4], dtype=torch.float32)
+
             highest = success.sum(dim=1)
 
-            L = self.extras["log"]
+            curriculum_mask = self.is_curriculum_episode
+            eval_mask = ~curriculum_mask
+
+            # overall progression
             for i in range(4):
                 L[f"subtasks/success_{i+1}"] = success[:, i].mean().item()
-            L["curriculum/highest_subtask"] = highest.mean().item()
+            L["env_compare/highest_subtask"] = highest.mean().item()
+
+            # eval for computing difficulty
+            if eval_mask.any():
+                eval_success = success[eval_mask].mean(dim=0)
+                L["env_compare/eval_success_mean"] = eval_success.mean().item()
+
+                for i in range(4):
+                    L[f"env_compare/eval_success_{i+1}"] = (eval_success[i].item())
+
+            # replay environment overall
+            if curriculum_mask.any():
+                replay_success = success[curriculum_mask].mean(dim=0)
+                L["env_compare/replay_success_mean"] = (replay_success.mean().item())
+
+                for i in range(4):
+                    L[f"env_compare/replay_success_{i+1}"] = (replay_success[i].item())
+
+            # replay competance per subtask
+            for task in range(4):
+                mask = (curriculum_mask & (self.curriculum_subtask == task))
+
+                if mask.any():
+                    replay_task_success = success[mask, task].mean()
+                    L[f"env_compare/replay_task_success_{task+1}"] = (replay_task_success.item())
+
+            if curriculum_mask.any() and eval_mask.any():
+                gap = eval_success - replay_success
+
+                L["env_compare/replay_task_success_gap_mean"] = (gap.mean().item())
+                for i in range(4):
+                    L[f"env_compare/replay_task_success_gap_{i+1}"] = (gap[i].item())
+            # sample counting
+            L[f"env_compare/replay_count_{task+1}"] = mask.sum().item()
 
     def _update_distribution(self):
         # mask to remove curriculum episodes from compute
@@ -470,7 +517,7 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         # greedy
         hard = torch.zeros_like(gaps)
-        hard[winner] = 1.0 
+        hard[winner] = 1.0
 
         # blend between the two
         blend = torch.clamp(margin / self.cfg.greedy_margin, 0.0, 1.0) # elegant: if margin is great than 0.1 then it will be clamped to 1.0. 
@@ -610,6 +657,8 @@ class FrankaCabinetEnv(DirectRLEnv):
             self.is_curriculum_episode[env_ids] = False
             self.is_curriculum_episode[env_ids[picked]] = True
 
+            self.curriculum_subtask[env_ids] = -1
+
             if picked.any():
                 # sample subtasks
                 subtasks = torch.multinomial(
@@ -618,6 +667,8 @@ class FrankaCabinetEnv(DirectRLEnv):
                     replacement=True,
                 )
 
+                self.curriculum_subtask[env_ids[picked]] = subtasks
+                
                 # subtasks = torch.full(
                 #     (int(picked.sum().item()),),
                 #     2,
