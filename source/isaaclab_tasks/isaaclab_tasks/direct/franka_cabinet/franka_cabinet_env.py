@@ -302,12 +302,6 @@ class FrankaCabinetEnv(DirectRLEnv):
             dtype=torch.long,
             device=self.device,
         )
-
-        # for using competance in our calculations
-        self.replay_task_success = torch.ones(
-            4,
-            device=self.device,
-        )
         
         # Controller
         self.progress = 0.0 # for tracking progression (0.0-1.0)
@@ -438,71 +432,52 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
-
             success = self.progression[:, :, 0]
+            eval_success = torch.zeros([4], dtype=torch.float32)
+            replay_success = torch.zeros([4], dtype=torch.float32)
+
+            highest = success.sum(dim=1)
 
             curriculum_mask = self.is_curriculum_episode
             eval_mask = ~curriculum_mask
 
-            highest = success.sum(dim=1)
+            # overall progression
+            for i in range(4):
+                L[f"subtasks/success_{i+1}"] = success[:, i].mean().item()
+            L["env_compare/highest_subtask"] = highest.mean().item()
 
-            # Overall progression (all environments)
-            L["progress/highest_subtask"] = highest.mean().item()
-
-            for task in range(4):
-                L[f"progress/success_{task+1}"] = (success[:, task].mean().item())
-
-            # Evaluation environments
-            # Used to estimate difficulty
-            eval_success = torch.zeros(4, device=self.device,)
-
+            # eval for computing difficulty
             if eval_mask.any():
                 eval_success = success[eval_mask].mean(dim=0)
+                L["env_compare/eval_success_mean"] = eval_success.mean().item()
 
-            L["eval/mean_success"] = eval_success.mean().item()
+                for i in range(4):
+                    L[f"env_compare/eval_success_{i+1}"] = (eval_success[i].item())
 
-            for task in range(4):
-                L[f"eval/success_{task+1}"] = (eval_success[task].item())
-
-            # Replay environments
-            # Overall replay performance
-            replay_success = torch.zeros(4, device=self.device,)
-
+            # replay environment overall
             if curriculum_mask.any():
                 replay_success = success[curriculum_mask].mean(dim=0)
+                L["env_compare/replay_success_mean"] = (replay_success.mean().item())
 
-            L["replay/mean_success"] = replay_success.mean().item()
+                for i in range(4):
+                    L[f"env_compare/replay_success_{i+1}"] = (replay_success[i].item())
 
-            for task in range(4):
-                L[f"replay/success_{task+1}"] = (replay_success[task].item())
-
-            # Replay competence
-            # Success only for environments replayed to that task
-            replay_competence = torch.zeros(4, device=self.device,)
-            replay_count = torch.zeros(4, device=self.device,)
-
+            # replay competance per subtask
             for task in range(4):
                 mask = (curriculum_mask & (self.curriculum_subtask == task))
-                replay_count[task] = mask.sum()
+
                 if mask.any():
-                    replay_competence[task] = (
-                        success[mask, task].mean()
-                    )
+                    replay_task_success = success[mask, task].mean()
+                    L[f"env_compare/replay_task_success_{task+1}"] = (replay_task_success.item())
 
-            self.replay_task_success = replay_competence
+            if curriculum_mask.any() and eval_mask.any():
+                gap = eval_success - replay_success
 
-            L["replay/mean_competence"] = (replay_competence.mean().item())
-
-            for task in range(4):
-                L[f"replay/competence_{task+1}"] = (replay_competence[task].item())
-                L[f"replay/count_{task+1}"] = (replay_count[task].item())
-
-            # Eval vs Replay comparison
-            competence_gap = eval_success - replay_competence
-            L["compare/mean_gap"] = competence_gap.mean().item()
-
-            for task in range(4):
-                L[f"compare/gap_{task+1}"] = competence_gap[task].item()
+                L["env_compare/replay_task_success_gap_mean"] = (gap.mean().item())
+                for i in range(4):
+                    L[f"env_compare/replay_task_success_gap_{i+1}"] = (gap[i].item())
+            # sample counting
+            L[f"env_compare/replay_count_{task+1}"] = mask.sum().item()
 
     def _update_distribution(self):
         # mask to remove curriculum episodes from compute
@@ -519,11 +494,9 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         # difficulty
         difficulty = 1.0 - self.success_rate # turns success rate (sr) into failure rate (fr)
-        competence = self.replay_task_success.detach()
-        priority = difficulty * competence.clamp(min=0.1).sqrt()
         # subtract the previous index from itself: [a, b, c, d] - [0, a, b, c]
-        previous = torch.cat([torch.zeros(1, device=self.device), priority[:-1]])
-        gaps = priority - previous # THIS is the distribution
+        previous = torch.cat([torch.zeros(1, device=self.device), difficulty[:-1]])
+        gaps = difficulty - previous # THIS is the distribution
         # alternative to clamping because we want to avoid losing info 
         gaps = gaps - gaps.min() # ensure all values are postitive
         gaps = gaps + 1e-8 # if all gaps are equal we don't want all 0s so add tiny value
@@ -562,9 +535,8 @@ class FrankaCabinetEnv(DirectRLEnv):
                 L[f"curriculum/success_rate_{i+1}"] = (self.success_rate[i].item())
                 L[f"curriculum/difficulty_{i+1}"] = (difficulty[i].item())
                 L[f"curriculum/distribution_{i+1}"] = (self.distribution[i].item())
+            for i in range(4):
                 L[f"curriculum/gap_{i+1}"] = gaps[i].item()
-                L[f"curriculum/priority_{i+1}"] = priority[i].item()
-                L[f"curriculum/competence_{i+1}"] = competence[i].item()
     
     def _run_curriculum_controller(self):
         # only run while curriculum is enabled
