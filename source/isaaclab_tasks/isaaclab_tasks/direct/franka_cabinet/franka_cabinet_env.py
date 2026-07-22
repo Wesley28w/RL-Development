@@ -386,17 +386,34 @@ class FrankaCabinetEnv(DirectRLEnv):
         completions = self._get_subtasks() # which are completed 
         world = self._get_world() # get the current poses of all envs
 
+        curriculum_mask = self.is_curriculum_episode
+
+        # Only track the task this episode was assigned
+        target_completion = torch.zeros_like(completions)
+
+        for task in range(4):
+            target_completion[:, task] = (
+                completions[:, task] &
+                (self.curriculum_subtask == task)
+            )
+
+        # Non curriculum environments track all subtasks normally
+        target_completion[~curriculum_mask] = completions[~curriculum_mask]
+
+
         completed_before = self.progression[:,:,0].bool() # [N, 4]
-        # which haven't been completed until now
-        new_completion = completions & (~completed_before)
-        
-        # store completion forver this episode
+        # only count valid new completions
+        new_completion = target_completion & (~completed_before)
+
+
+        # store completion forever this episode
         self.progression[:, :, 0] = torch.maximum(
             self.progression[:, :, 0],
-            completions.float(),
+            target_completion.float(),
         )
 
         world_expanded = world[:,None,:].expand(-1,4,-1)
+
         # insert the worlds to where there was a new completion
         self.progression[:,:,1:] = torch.where(
             new_completion[:,:,None],
@@ -404,24 +421,9 @@ class FrankaCabinetEnv(DirectRLEnv):
             self.progression[:,:,1:]
         )
         
-        # Only store replay successes for the task that was sampled
-        curriculum_completion = (
-            new_completion &
-            self.is_curriculum_episode[:, None]
-        )
 
-        # Only the intended curriculum subtask can write
-        valid_completion = torch.zeros_like(curriculum_completion)
-
-        for task in range(4):
-            valid_completion[:, task] = (
-                curriculum_completion[:, task] &
-                (self.curriculum_subtask == task)
-            )
-
-
-        completed_envs, completed_tasks = torch.where(valid_completion)
-
+        # add successful worlds to buffer (only assigned replay tasks)
+        completed_envs, completed_tasks = torch.where(new_completion)
 
         if len(completed_envs) > 0:
 
@@ -448,7 +450,7 @@ class FrankaCabinetEnv(DirectRLEnv):
                     self.pose_buffer_idx[task] = (
                         start + count
                     ) % self.cfg.success_buffer_size
-
+                    
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
             success = self.progression[:, :, 0]
