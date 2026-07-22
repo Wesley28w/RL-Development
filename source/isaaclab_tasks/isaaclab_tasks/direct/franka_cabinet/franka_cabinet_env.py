@@ -404,23 +404,34 @@ class FrankaCabinetEnv(DirectRLEnv):
             self.progression[:,:,1:]
         )
         
-        # Only store replay successes for the task that was sampled
-        curriculum_completion = (
+        eval_completion = (
             new_completion &
-            self.is_curriculum_episode[:, None]
+            (~self.is_curriculum_episode[:, None])
         )
 
         # Only the intended curriculum subtask can write
-        valid_completion = torch.zeros_like(curriculum_completion)
+        valid_completion = torch.zeros_like(eval_completion)
 
         for task in range(4):
             valid_completion[:, task] = (
-                curriculum_completion[:, task] &
+                eval_completion[:, task] &
                 (self.curriculum_subtask == task)
             )
 
 
-        completed_envs, completed_tasks = torch.where(valid_completion)
+        # Only store the highest achieved subtask
+        highest_task = torch.argmax(
+            new_completion.float(),
+            dim=1
+        )
+
+        has_completion = new_completion.any(dim=1)
+
+        completed_envs = torch.where(
+            eval_completion.any(dim=1)
+        )[0]
+
+        completed_tasks = highest_task[completed_envs]
 
 
         if len(completed_envs) > 0:
