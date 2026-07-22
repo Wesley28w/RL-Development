@@ -420,10 +420,14 @@ class FrankaCabinetEnv(DirectRLEnv):
             world_expanded,
             self.progression[:,:,1:]
         )
-        
 
-        # add successful worlds to buffer (only assigned replay tasks)
-        completed_envs, completed_tasks = torch.where(new_completion)
+        # Only eval environments can add to replay buffer
+        buffer_completion = (
+            new_completion &
+            (~curriculum_mask[:, None])
+        )
+
+        completed_envs, completed_tasks = torch.where(buffer_completion)
 
         if len(completed_envs) > 0:
 
@@ -462,6 +466,15 @@ class FrankaCabinetEnv(DirectRLEnv):
             curriculum_mask = self.is_curriculum_episode
             eval_mask = ~curriculum_mask
 
+            # buffers
+            L["buffer/new_eval_poses"] = len(completed_envs)
+            for i in range(4):
+                L[f"buffer/fill_{i+1}"] = (
+                    (self.success_buffer[i].abs().sum(dim=1) > 0)
+                    .float()
+                    .mean()
+                    .item()
+                )
             # overall progression
             for i in range(4):
                 L[f"subtasks/success_{i+1}"] = success[:, i].mean().item()
