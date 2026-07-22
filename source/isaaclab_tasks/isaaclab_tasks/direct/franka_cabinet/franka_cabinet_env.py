@@ -487,6 +487,9 @@ class FrankaCabinetEnv(DirectRLEnv):
             for task in range(4):
                 mask = (curriculum_mask & (self.curriculum_subtask == task))
 
+                # sample counting
+                L[f"env_compare/replay_count_{task+1}"] = mask.sum().item()
+
                 if mask.any():
                     replay_task_success = success[mask, task].mean()
                     L[f"env_compare/replay_task_success_{task+1}"] = (replay_task_success.item())
@@ -497,8 +500,6 @@ class FrankaCabinetEnv(DirectRLEnv):
                 L["env_compare/replay_task_success_gap_mean"] = (gap.mean().item())
                 for i in range(4):
                     L[f"env_compare/replay_task_success_gap_{i+1}"] = (gap[i].item())
-            # sample counting
-            L[f"env_compare/replay_count_{task+1}"] = mask.sum().item()
 
     def _update_distribution(self):
         # mask to remove curriculum episodes from compute
