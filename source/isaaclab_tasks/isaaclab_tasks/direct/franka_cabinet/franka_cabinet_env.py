@@ -404,16 +404,35 @@ class FrankaCabinetEnv(DirectRLEnv):
             self.progression[:,:,1:]
         )
         
-        # add successful worlds to buffer (sliding)
-        completed_envs, completed_tasks = torch.where(new_completion)
+        # Only store replay successes for the task that was sampled
+        curriculum_completion = (
+            new_completion &
+            self.is_curriculum_episode[:, None]
+        )
+
+        # Only the intended curriculum subtask can write
+        valid_completion = torch.zeros_like(curriculum_completion)
+
+        for task in range(4):
+            valid_completion[:, task] = (
+                curriculum_completion[:, task] &
+                (self.curriculum_subtask == task)
+            )
+
+
+        completed_envs, completed_tasks = torch.where(valid_completion)
+
 
         if len(completed_envs) > 0:
+
             completed_worlds = world[completed_envs]
 
             for task in range(4):
+
                 task_mask = completed_tasks == task
 
                 if task_mask.any():
+
                     worlds = completed_worlds[task_mask]
 
                     start = self.pose_buffer_idx[task]
