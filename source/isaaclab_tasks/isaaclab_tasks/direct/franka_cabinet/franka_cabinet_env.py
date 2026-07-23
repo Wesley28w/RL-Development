@@ -32,7 +32,7 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     state_space = 0
 
     # reset state curriculum
-    reset_state_curriculum_enabled = False # True
+    reset_state_curriculum_enabled = True # True
 
     # simulation
     sim: SimulationCfg = SimulationCfg(
@@ -285,7 +285,8 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         # success buffer
         self.success_buffer = torch.zeros([4, self.cfg.success_buffer_size, 13], device=self.device) # 4 subtasks, buffer size of 64, and 13 joint attributes to save 
-    
+        self.pose_visit_count = torch.zeros(4, self.cfg.success_buffer_size, device=self.device) # for tracking the amount of times we visit a certain pose
+        
         self.pose_buffer_idx = torch.zeros(
             4,
             dtype=torch.long,
@@ -425,6 +426,7 @@ class FrankaCabinetEnv(DirectRLEnv):
                     ) % self.cfg.success_buffer_size
 
                     self.success_buffer[task, indices] = worlds
+                    self.pose_visit_count[task, indices] = 0
 
                     self.pose_buffer_idx[task] = (
                         start + count
@@ -638,7 +640,8 @@ class FrankaCabinetEnv(DirectRLEnv):
         if (self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled):
             # force X% of envrionments to be non curriculum (evals instead)
             sample_ratio = self.cfg.sampling_ratio
-
+            avg_visits = 0.0
+            avg_sigma = 0.0
             # if self.progress > 0.9:
             #     sample_ratio = min(sample_ratio + 0.35, 1.0)
             # elif self.progress > 0.5:
@@ -685,18 +688,42 @@ class FrankaCabinetEnv(DirectRLEnv):
                 )
 
                 worlds = self.success_buffer[subtasks, world_ids]
+                self.pose_visit_count[subtasks, world_ids] += 1
+                visits = self.pose_visit_count[subtasks, world_ids]
+
+                sigma = self.cfg.curriculum_dr * (
+                    1.0 - torch.exp(-visits.float() / 25.0)
+                )
+                sigma = torch.clamp(
+                    sigma,
+                    max=self.cfg.curriculum_dr * 0.75,
+                )
 
                 # overwrite default reset with curriculum reset
                 robot_joint_pos[picked] = worlds[:, 0:9]
                 cabinet[picked] = worlds[:, 9:13]
 
-                # optional domain randomization
-                robot_joint_pos[picked] += sample_uniform(
-                    -self.cfg.curriculum_dr,
-                    self.cfg.curriculum_dr,
-                    robot_joint_pos[picked].shape,
-                    self.device,
+                noise = torch.randn_like(robot_joint_pos[picked])
+
+                joint_range = (
+                    self.robot_dof_upper_limits -
+                    self.robot_dof_lower_limits
                 )
+
+                robot_joint_pos[picked] += (
+                    noise *
+                    sigma[:, None] *
+                    joint_range[None]
+                )
+
+                robot_joint_pos[picked] = torch.clamp(
+                    robot_joint_pos[picked],
+                    self.robot_dof_lower_limits,
+                    self.robot_dof_upper_limits,
+                )
+
+                avg_visits = visits.float().mean().item()
+                avg_sigma = sigma.mean().item()
 
         # reset progression buffer of all environments reset
         self.progression[env_ids] = 0 # set back to incomplete
@@ -722,10 +749,12 @@ class FrankaCabinetEnv(DirectRLEnv):
             L["curriculum/reset_distance"] = distance.mean().item()
             L["curriculum/reset_variance"] = variance.item()
             L["curriculum/natural"] = self.is_curriculum_episode.float().mean()
+            L["curriculum/avg_pose_visits"] = avg_visits
+            L["curriculum/avg_pose_sigma"] = avg_sigma
             if self.curriculum_enabled:
                 L["curriculum/sample_rate"] = picked.float().mean().item() # make sure we are sampling correct ratio
                 L["curriculum/sample_ratio_target"] = sample_ratio
-
+            
     def _get_observations(self) -> dict:
         dof_pos_scaled = (
             2.0
