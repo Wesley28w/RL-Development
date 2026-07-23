@@ -336,7 +336,9 @@ class FrankaCabinetEnv(DirectRLEnv):
     # pre-physics step calls
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        self.actions = (actions.clone() + torch.randn_like(actions) * self.cfg.action_std).clamp(-1.0, 1.0)
+        if self.curriculum_enabled:
+            actions = (actions.clone() + torch.randn_like(actions) * self.cfg.action_std)
+        self.actions = actions.clamp(-1.0, 1.0)
         targets = self.robot_dof_targets + self.robot_dof_speed_scales * self.dt * self.actions * self.cfg.action_scale
         self.robot_dof_targets[:] = torch.clamp(targets, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
 
@@ -747,8 +749,8 @@ class FrankaCabinetEnv(DirectRLEnv):
             ),
             dim=-1,
         )
-
-        obs += (torch.randn_like(obs)*self.cfg.observation_std)
+        if self.curriculum_enabled and self.cfg.observation_std > 0:
+            obs += (torch.randn_like(obs)*self.cfg.observation_std)
         return {"policy": torch.clamp(obs, -5.0, 5.0)}
 
     # auxiliary methods
