@@ -32,7 +32,7 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     state_space = 0
 
     # reset state curriculum
-    reset_state_curriculum_enabled = False # True
+    reset_state_curriculum_enabled = True # True
 
     # simulation
     sim: SimulationCfg = SimulationCfg(
@@ -164,6 +164,8 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     prob_exp = 2 # how much we sharpen the probability distribution (1 = No sharpening)
     sampling_ratio = 0.3 # what fraction of resets go to the sample distribution
     curriculum_dr = 0.02 # how much domain randomization to apply to robot joints
+    action_std = 0.05 # action noise for curriculum environments
+    observation_std = 0.00 # noise added for curriculum environments
     success_rate_alpha = 0.05 # momentum control of success rate movement (pre-calculations)
     greedy_margin = 0.10 # controls the margin between top and second distribution value that enables softmax
     update_dis_percent = 10 # update 
@@ -334,7 +336,7 @@ class FrankaCabinetEnv(DirectRLEnv):
     # pre-physics step calls
 
     def _pre_physics_step(self, actions: torch.Tensor):
-        self.actions = actions.clone().clamp(-1.0, 1.0)
+        self.actions = (actions.clone() + torch.randn_like(actions) * self.cfg.action_std).clamp(-1.0, 1.0)
         targets = self.robot_dof_targets + self.robot_dof_speed_scales * self.dt * self.actions * self.cfg.action_scale
         self.robot_dof_targets[:] = torch.clamp(targets, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
 
@@ -745,6 +747,8 @@ class FrankaCabinetEnv(DirectRLEnv):
             ),
             dim=-1,
         )
+
+        obs += (torch.randn_like(obs)*self.cfg.observation_std)
         return {"policy": torch.clamp(obs, -5.0, 5.0)}
 
     # auxiliary methods
