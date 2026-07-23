@@ -164,6 +164,7 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     prob_exp = 2 # how much we sharpen the probability distribution (1 = No sharpening)
     sampling_ratio = 0.3 # what fraction of resets go to the sample distribution
     curriculum_dr = 0.02 # how much domain randomization to apply to robot joints
+    entropy_max_step = 15.0 # what step should entropy reach its max
     success_rate_alpha = 0.05 # momentum control of success rate movement (pre-calculations)
     greedy_margin = 0.10 # controls the margin between top and second distribution value that enables softmax
     update_dis_percent = 10 # update 
@@ -692,11 +693,9 @@ class FrankaCabinetEnv(DirectRLEnv):
                 visits = self.pose_visit_count[subtasks, world_ids]
 
                 sigma = self.cfg.curriculum_dr * (
-                    1.0 - torch.exp(-visits.float() / 25.0)
-                )
-                sigma = torch.clamp(
-                    sigma,
-                    max=self.cfg.curriculum_dr * 0.75,
+                    1.0 - torch.exp(
+                        -visits.float() / self.cfg.entropy_max_step
+                    )
                 )
 
                 # overwrite default reset with curriculum reset
