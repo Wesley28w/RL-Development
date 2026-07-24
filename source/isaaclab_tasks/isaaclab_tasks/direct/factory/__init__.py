@@ -11,6 +11,8 @@ from . import agents
 # Register Gym environments.
 ##
 
+# We will use the thread factory
+
 gym.register(
     id="Isaac-Factory-PegInsert-Direct-v0",
     entry_point=f"{__name__}.factory_env:FactoryEnv",

@@ -15,6 +15,8 @@ from . import agents
 # Joint Position Control
 ##
 
+# lets apply curriculum to this one
+
 gym.register(
     id="Isaac-Lift-Cube-OpenArm-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
