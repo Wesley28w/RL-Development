@@ -88,6 +88,8 @@ class FactoryEnvCfg(DirectRLEnvCfg):
         "fixed_quat",
     ]
 
+    reset_state_curriculum_enabled = True
+
     task_name: str = "peg_insert"  # peg_insert, gear_mesh, nut_thread
     task: FactoryTask = FactoryTask()
     obs_rand: ObsRandCfg = ObsRandCfg()
@@ -187,6 +189,20 @@ class FactoryEnvCfg(DirectRLEnvCfg):
         },
     )
 
+    # custom hyperparameters
+    success_buffer_size = 64
+    prob_exp = 2 # how much we sharpen the probability distribution (1 = No sharpening)
+    sampling_ratio = 0.3 # what fraction of resets go to the sample distribution
+    curriculum_dr = 0.02 # how much domain randomization to apply to robot joints
+    success_rate_alpha = 0.05 # momentum control of success rate movement (pre-calculations)
+    greedy_margin = 0.10 # controls the margin between top and second distribution value that enables softmax
+
+    # policy params
+    curriculum_total_iterations = 200 # rl_games does it differenlty
+    controller_enabled = False
+    window_analysis_size = 0.02 # percent to look at
+    window_analysis_start = 0.01 # percent to start at
+    slope_threshold = 2.0 # what threshold slope will disable curriculum
 
 @configclass
 class FactoryTaskPegInsertCfg(FactoryEnvCfg):

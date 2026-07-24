@@ -14,7 +14,7 @@ from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.utils.math import axis_angle_from_quat
+from isaaclab.utils.math import axis_angle_from_quat, sample_uniform
 
 from . import factory_control, factory_utils
 from .factory_env_cfg import OBS_DIM_CFG, STATE_DIM_CFG, FactoryEnvCfg
@@ -36,6 +36,36 @@ class FactoryEnv(DirectRLEnv):
         factory_utils.set_body_inertias(self._robot, self.scene.num_envs)
         self._init_tensors()
         self._set_default_dynamics_parameters()
+
+        self.progression = torch.zeros([self.num_envs, 3, 23], device=self.device) # 3 subtasks and 23 for (completed, pose)
+        self.success_rate = torch.zeros(3, device=self.device) # 3 is number of subtasks
+
+        self.distrubtion = torch.softmax(torch.ones([3], device=self.device), dim=0)
+
+        self.success_buffer = torch.zeros([3, self.cfg.success_buffer_size, 22], device=self.device) # 7 for fixed, 7 for grasped, 8 for robot joints
+
+        self.pose_buffer_idx = torch.zeros(
+            3,
+            dtype=torch.long,
+            device=self.device
+        )
+
+        self.is_curriculum_episode = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+        self.curriculum_subtask = torch.full(
+            (self.num_envs,),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        # Controller
+        self.progress = 0.0 # for tracking progression (0.0-1.0)
+        self.curriculum_enabled = self.cfg.reset_state_curriculum_enabled # set to whatever cfg (mutable)
+        self.overall_success = 0.0 # final task success (0.0-1.0)
+        self.controller_snapshot = None
+        self.controller_snapshot_two = None
+        self.controller_checked = False
 
     def _set_default_dynamics_parameters(self):
         """Set parameters defining dynamic interactions."""
@@ -338,6 +368,9 @@ class FactoryEnv(DirectRLEnv):
         """
         self._compute_intermediate_values(dt=self.physics_dt)
         time_out = self.episode_length_buf >= self.max_episode_length - 1
+        if hasattr(self, "extras") and "log" in self.extras:
+            L = self.extras["log"]
+            L["dones/success_rate"] = (time_out / torch.ones_like(time_out)).sum().item()
         return time_out, time_out
 
     def _get_curr_successes(self, success_threshold, check_rot=False):
@@ -381,6 +414,219 @@ class FactoryEnv(DirectRLEnv):
 
         return curr_successes
 
+    # returns each environment completion of the subtasks [N, 3]
+    def _get_subtasks(self) -> torch.Tensor:
+        held_base_pos, held_base_quat = factory_utils.get_held_base_pose(
+            self.held_pos, self.held_quat, self.cfg_task.name, self.cfg_task.fixed_asset_cfg, self.num_envs, self.device
+        )
+        target_held_base_pos, target_held_base_quat = factory_utils.get_target_held_base_pose(
+            self.fixed_pos,
+            self.fixed_quat,
+            self.cfg_task.name,
+            self.cfg_task.fixed_asset_cfg,
+            self.num_envs,
+            self.device,
+        )
+        xy_dist = torch.linalg.vector_norm(target_held_base_pos[:, 0:2] - held_base_pos[:, 0:2], dim=1)
+        z_disp = held_base_pos[:, 2] - target_held_base_pos[:, 2]
+        
+        pitch = self.cfg_task.fixed_asset_cfg.thread_pitch
+        # aligned with the screw
+        aligned = ((xy_dist < 0.0025)& (z_disp < pitch * 0.1))
+        # one threaded down
+        one_thread = ((xy_dist < 0.0025)& (z_disp < pitch * 1.0))
+        # one and a half thread
+        one_half_thread = ((xy_dist < 0.0025)& (z_disp < pitch * 1.5))
+
+        return torch.stack([aligned, one_thread, one_half_thread], dim=1)
+
+    def _get_world(self) -> torch.Tensor:
+        return torch.cat([
+            self._robot.data.joint_pos, # (8)   
+            self._held_asset.data.root_pos_w, # (3)
+            self._held_asset.data.root_quat_w, # (4)
+            self._fixed_asset.data.root_pos_w, # (3)
+            self._fixed_asset.data.root_quat_w, # (4)
+        ])
+    
+    def _update_progression(self):
+        completions = self._get_subtasks() # which are completed 
+        world = self._get_world() # get the current poses of all envs
+
+        completed_before = self.progression[:,:,0].bool() # [N, 3]
+        # which haven't been completed until now
+        new_completion = completions & (~completed_before)
+        
+        # store completion forver this episode
+        self.progression[:, :, 0] = torch.maximum(
+            self.progression[:, :, 0],
+            completions.float(),
+        )
+
+        world_expanded = world[:,None,:].expand(-1,3,-1)
+        # insert the worlds to where there was a new completion
+        self.progression[:,:,1:] = torch.where(
+            new_completion[:,:,None],
+            world_expanded,
+            self.progression[:,:,1:]
+        )
+        
+        # add successful worlds to buffer (sliding)
+        completed_envs, completed_tasks = torch.where(new_completion)
+
+        if len(completed_envs) > 0:
+            completed_worlds = world[completed_envs]
+
+            for task in range(3):
+                task_mask = completed_tasks == task
+
+                if task_mask.any():
+                    worlds = completed_worlds[task_mask]
+
+                    start = self.pose_buffer_idx[task]
+                    count = worlds.shape[0]
+
+                    indices = (
+                        torch.arange(count, device=self.device)
+                        + start
+                    ) % self.cfg.success_buffer_size
+
+                    self.success_buffer[task, indices] = worlds
+
+                    self.pose_buffer_idx[task] = (
+                        start + count
+                    ) % self.cfg.success_buffer_size
+
+        if hasattr(self, "extras") and "log" in self.extras:
+            L = self.extras["log"]
+            success = self.progression[:, :, 0]
+            eval_success = torch.zeros([3], dtype=torch.float32)
+            replay_success = torch.zeros([3], dtype=torch.float32)
+
+            highest = success.sum(dim=1)
+
+            curriculum_mask = self.is_curriculum_episode
+            eval_mask = ~curriculum_mask
+
+            # overall progression
+            for i in range(3):
+                L[f"subtasks/success_{i+1}"] = success[:, i].mean().item()
+            L["env_compare/highest_subtask"] = highest.mean().item()
+
+            # eval for computing difficulty
+            if eval_mask.any():
+                eval_success = success[eval_mask].mean(dim=0)
+                L["env_compare/eval_success_mean"] = eval_success.mean().item()
+
+                for i in range(3):
+                    L[f"env_compare/eval_success_{i+1}"] = (eval_success[i].item())
+
+            # replay environment overall
+            if curriculum_mask.any():
+                replay_success = success[curriculum_mask].mean(dim=0)
+                L["env_compare/replay_success_mean"] = (replay_success.mean().item())
+
+                for i in range(3):
+                    L[f"env_compare/replay_success_{i+1}"] = (replay_success[i].item())
+
+            # replay competance per subtask
+            for task in range(3):
+                mask = (curriculum_mask & (self.curriculum_subtask == task))
+
+                if mask.any():
+                    replay_task_success = success[mask, task].mean()
+                    L[f"env_compare/replay_task_success_{task+1}"] = (replay_task_success.item())
+
+            if curriculum_mask.any() and eval_mask.any():
+                gap = eval_success - replay_success
+
+                L["env_compare/replay_task_success_gap_mean"] = (gap.mean().item())
+                for i in range(3):
+                    L[f"env_compare/replay_task_success_gap_{i+1}"] = (gap[i].item())
+            # sample counting
+            L[f"env_compare/replay_count_{task+1}"] = mask.sum().item()
+
+    def _update_distribution(self):
+        # mask to remove curriculum episodes from compute
+        mask = ~self.is_curriculum_episode
+        # edge case where every env is curriculum
+        if mask.sum() == 0:
+            return
+        
+        batch_success = (self.progression[mask, :, 0].float().mean(dim=0))
+
+        # ema on the success rate to filter noise
+        alpha = self.cfg.success_rate_alpha
+        self.success_rate = ((1.0 - alpha) * self.success_rate + alpha * batch_success)
+
+        # difficulty
+        difficulty = 1.0 - self.success_rate # turns success rate (sr) into failure rate (fr)
+        # subtract the previous index from itself: [a, b, c, d] - [0, a, b, c]
+        previous = torch.cat([torch.zeros(1, device=self.device), difficulty[:-1]])
+        gaps = difficulty - previous # THIS is the distribution
+        # alternative to clamping because we want to avoid losing info 
+        gaps = gaps - gaps.min() # ensure all values are postitive
+        gaps = gaps + 1e-8 # if all gaps are equal we don't want all 0s so add tiny value
+        
+        # softmax distribution 
+        soft = gaps.pow(
+            self.cfg.prob_exp
+        ).softmax(dim=0)
+
+        # confidence
+        confidence = (
+            gaps / gaps.sum().clamp(min=1e-8) # linear norm
+        )
+
+        top2 = torch.topk(confidence, k=2)
+        winner = top2.indices[0] # biggest fr
+        margin = (top2.values[0] - top2.values[1]) # difference between biggest and second biggest fr
+
+        # greedy
+        hard = torch.zeros_like(gaps)
+        hard[winner] = 1.0
+
+        # blend between the two
+        blend = torch.clamp(margin / self.cfg.greedy_margin, 0.0, 1.0) # elegant: if margin is great than 0.1 then it will be clamped to 1.0. 
+        self.distribution = ((1.0 - blend) * soft + blend * hard)
+        self.distribution /= self.distribution.sum()
+        # self.distribution = soft
+
+        # for logging
+        if hasattr(self, "extras") and "log" in self.extras:
+            L = self.extras["log"]
+            L["curriculum/blend"] = blend.item()
+            L["curriculum/margin"] = margin.item()
+            L["curriculum/selected"] = winner.item()
+            for i in range(3):
+                L[f"curriculum/success_rate_{i+1}"] = (self.success_rate[i].item())
+                L[f"curriculum/difficulty_{i+1}"] = (difficulty[i].item())
+                L[f"curriculum/distribution_{i+1}"] = (self.distribution[i].item())
+            for i in range(3):
+                L[f"curriculum/gap_{i+1}"] = gaps[i].item()
+    
+    def _run_curriculum_controller(self):
+        # only run while curriculum is enabled
+        if not self.curriculum_enabled:
+            return
+
+        success = self.overall_success.mean().item() # TODO: switch to ema smoothed success_rate var
+
+        # Take snapshot once
+        if (self.progress >= self.cfg.window_analysis_start and self.controller_snapshot is None):
+            self.controller_snapshot = success
+
+        # Evaluate once
+        if (
+            self.progress >= self.cfg.window_analysis_start + self.cfg.window_analysis_size
+            and not self.controller_checked
+        ):
+            self.controller_checked = True
+            self.controller_snapshot_two = success
+            delta_success = success - self.controller_snapshot
+            slope = (delta_success / self.cfg.window_analysis_size)
+            self.curriculum_enabled = (slope > self.cfg.slope_threshold)
+
     def _log_factory_metrics(self, rew_dict, curr_successes):
         """Keep track of episode statistics and log rewards."""
         # Only log episode success rates at the end of an episode.
@@ -404,6 +650,27 @@ class FactoryEnv(DirectRLEnv):
 
     def _get_rewards(self):
         """Update rewards and compute success statistics."""
+
+        # update progress TODO: compute properly
+        self.progress = min(
+            self.common_step_counter /
+            (self.cfg.curriculum_total_iterations * 16),
+            1.0,
+        )
+        # run controller for choosing enable/disable
+        if self.cfg.reset_state_curriculum_enabled and self.cfg.controller_enabled:
+            self._run_curriculum_controller()
+
+        # # custom curriclum work
+        self._update_progression() # update data each step
+        # uses the updated progressions
+        if self.cfg.reset_state_curriculum_enabled:
+            if torch.rand((), device=self.device) < 0.10:
+                self._update_distribution()
+        else: # keep determinisitc by not messing with the rand generator
+            if self.common_step_counter % 10 == 0:
+                self._update_distribution()
+
         # Get successful and failed envs at current timestep
         check_rot = self.cfg_task.name == "nut_thread"
         curr_successes = self._get_curr_successes(
@@ -488,23 +755,96 @@ class FactoryEnv(DirectRLEnv):
     def _reset_idx(self, env_ids):
         """We assume all envs will always be reset at the same time."""
         super()._reset_idx(env_ids)
+        held_state = self._held_asset.data.default_root_state.clone()[env_ids] # (7)
+        fixed_state = self._fixed_asset.data.default_root_state.clone()[env_ids] # (7)
+        robot_pose = self._robot.data.default_root_state.clone()[env_ids] # 8
 
-        self._set_assets_to_default_pose(env_ids)
-        self._set_franka_to_default_pose(joints=self.cfg.ctrl.reset_joints, env_ids=env_ids)
+        if (self.curriculum_enabled):
+             # force X% of envrionments to be non curriculum (evals instead)
+            sample_ratio = self.cfg.sampling_ratio
+
+            num_curriculum = int(len(env_ids) * sample_ratio)
+
+            perm = torch.randperm(len(env_ids), device=self.device)
+
+            picked = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
+            picked[perm[:num_curriculum]] = True
+
+            # update what episodes are actively using the curriculum
+            self.is_curriculum_episode[env_ids] = False
+            self.is_curriculum_episode[env_ids[picked]] = True
+
+            self.curriculum_subtask[env_ids] = -1
+
+            if picked.any():
+                # sample subtasks
+                subtasks = torch.multinomial(
+                    self.distribution,
+                    int(picked.sum().item()), # change value to 0 for reset always to subtask 1, value to 1 for reset always to subtask 2, etc
+                    replacement=True,
+                )
+
+                self.curriculum_subtask[env_ids[picked]] = subtasks
+                
+                # subtasks = torch.full(
+                #     (int(picked.sum().item()),),
+                #     2,
+                #     device=self.device,
+                #     dtype=torch.long,
+                # )
+
+                # sample stored worlds
+                world_ids = torch.randint(
+                    0,
+                    self.cfg.success_buffer_size,
+                    (int(picked.sum().item()),),
+                    device=self.device,
+                )
+                worlds = self.success_buffer[subtasks, world_ids]
+                robot_pose[picked] = worlds[:, :8]
+                held_state[picked] = worlds[:, 8:15]
+                fixed_state[picked] = worlds[:,15:22]
+
+                # optional domain randomization
+                robot_pose[picked] += sample_uniform(
+                    -self.cfg.curriculum_dr,
+                    self.cfg.curriculum_dr,
+                    robot_pose[picked].shape,
+                    self.device,
+                )
+
+        # reset progression buffer of all environments reset
+        self.progression[env_ids] = 0 # set back to incomplete
+
+        self._set_assets_to_default_pose(env_ids=env_ids, held_state=held_state, fixed_state=fixed_state)
+        self._set_franka_to_default_pose(joints=robot_pose, env_ids=env_ids)
         self.step_sim_no_action()
 
         self.randomize_initial_state(env_ids)
+        
+        if hasattr(self, "extras") and "log" in self.extras:
+            variance = (robot_pose - self._robot.data.default_joint_pos[env_ids]).pow(2).mean() # mean squared difference
+            distance = torch.norm(robot_pose - self._robot.data.default_joint_pos[env_ids], dim=1) # distance from the actual joint positions
+            
+            # logging for variance on reset world
+            L = self.extras["log"]
+            L["curriculum/reset_distance"] = distance.mean().item()
+            L["curriculum/reset_variance"] = variance.item()
+            L["curriculum/natural"] = self.is_curriculum_episode.float().mean()
+            if self.curriculum_enabled:
+                L["curriculum/sample_rate"] = picked.float().mean().item() # make sure we are sampling correct ratio
+                L["curriculum/sample_ratio_target"] = sample_ratio
 
-    def _set_assets_to_default_pose(self, env_ids):
+    def _set_assets_to_default_pose(self, held_state, fixed_state, env_ids):
         """Move assets to default pose before randomization."""
-        held_state = self._held_asset.data.default_root_state.clone()[env_ids]
+        held_state=held_state
         held_state[:, 0:3] += self.scene.env_origins[env_ids]
         held_state[:, 7:] = 0.0
         self._held_asset.write_root_pose_to_sim(held_state[:, 0:7], env_ids=env_ids)
         self._held_asset.write_root_velocity_to_sim(held_state[:, 7:], env_ids=env_ids)
         self._held_asset.reset()
 
-        fixed_state = self._fixed_asset.data.default_root_state.clone()[env_ids]
+        fixed_state = fixed_state
         fixed_state[:, 0:3] += self.scene.env_origins[env_ids]
         fixed_state[:, 7:] = 0.0
         self._fixed_asset.write_root_pose_to_sim(fixed_state[:, 0:7], env_ids=env_ids)
@@ -589,7 +929,7 @@ class FactoryEnv(DirectRLEnv):
         gripper_width = self.cfg_task.held_asset_cfg.diameter / 2 * 1.25
         joint_pos = self._robot.data.default_joint_pos[env_ids]
         joint_pos[:, 7:] = gripper_width  # MIMIC
-        joint_pos[:, :7] = torch.tensor(joints, device=self.device)[None, :]
+        joint_pos[:, :7] = joints[None, :]
         joint_vel = torch.zeros_like(joint_pos)
         joint_effort = torch.zeros_like(joint_pos)
         self.ctrl_target_joint_pos[env_ids, :] = joint_pos
