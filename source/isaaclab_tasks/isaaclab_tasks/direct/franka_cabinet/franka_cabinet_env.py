@@ -164,11 +164,10 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     prob_exp = 2 # how much we sharpen the probability distribution (1 = No sharpening)
     sampling_ratio = 0.3 # what fraction of resets go to the sample distribution
     curriculum_dr = 0.02 # how much domain randomization to apply to robot joints
-    action_std = 0.05 # action noise for curriculum environments
-    observation_std = 0.00 # noise added for curriculum environments
+    action_std = 0.000 # action noise for curriculum environments
+    observation_std = 0.005 # noise added for curriculum environments
     success_rate_alpha = 0.05 # momentum control of success rate movement (pre-calculations)
     greedy_margin = 0.10 # controls the margin between top and second distribution value that enables softmax
-    update_dis_percent = 10 # update 
     
     # policy params
     curriculum_total_iterations = 2500
