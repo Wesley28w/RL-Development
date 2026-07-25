@@ -40,7 +40,7 @@ class FactoryEnv(DirectRLEnv):
         self.progression = torch.zeros([self.num_envs, 3, 23], device=self.device) # 3 subtasks and 23 for (completed, pose)
         self.success_rate = torch.zeros(3, device=self.device) # 3 is number of subtasks
 
-        self.distrubtion = torch.softmax(torch.ones([3], device=self.device), dim=0)
+        self.distribution = torch.softmax(torch.ones([3], device=self.device), dim=0)
 
         self.success_buffer = torch.zeros([3, self.cfg.success_buffer_size, 22], device=self.device) # 7 for fixed, 7 for grasped, 8 for robot joints
 
