@@ -369,8 +369,10 @@ class FactoryEnv(DirectRLEnv):
         self._compute_intermediate_values(dt=self.physics_dt)
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         if hasattr(self, "extras") and "log" in self.extras:
+            check_rot = self.cfg_task.name == "nut_thread"
+            curr_success = self._get_curr_successes(self.cfg_task.success_threshold, check_rot=check_rot)
             L = self.extras["log"]
-            L["dones/success_rate"] = (time_out / torch.ones_like(time_out)).sum().item()
+            L["dones/success_rate"] = curr_success.float().mean().item()
         return time_out, time_out
 
     def _get_curr_successes(self, success_threshold, check_rot=False):
@@ -437,6 +439,16 @@ class FactoryEnv(DirectRLEnv):
         one_thread = ((xy_dist < 0.0025)& (z_disp < pitch * 1.0))
         # one and a half thread
         one_half_thread = ((xy_dist < 0.0025)& (z_disp < pitch * 1.5))
+
+        _, _, curr_yaw = torch_utils.get_euler_xyz(self.fingertip_midpoint_quat)
+        curr_yaw = factory_utils.wrap_yaw(curr_yaw)
+
+        is_rotated = curr_yaw < self.cfg_task.ee_success_yaw
+
+        # consider rotation
+        aligned &= is_rotated
+        one_thread &= is_rotated
+        one_half_thread &= is_rotated
 
         return torch.stack([aligned, one_thread, one_half_thread], dim=1)
 
@@ -664,12 +676,7 @@ class FactoryEnv(DirectRLEnv):
         # # custom curriclum work
         self._update_progression() # update data each step
         # uses the updated progressions
-        if self.cfg.reset_state_curriculum_enabled:
-            if torch.rand((), device=self.device) < 0.10:
-                self._update_distribution()
-        else: # keep determinisitc by not messing with the rand generator
-            if self.common_step_counter % 10 == 0:
-                self._update_distribution()
+        self._update_distribution()
 
         # Get successful and failed envs at current timestep
         check_rot = self.cfg_task.name == "nut_thread"
@@ -757,10 +764,19 @@ class FactoryEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
         held_state = self._held_asset.data.default_root_state.clone()[env_ids] # (7)
         fixed_state = self._fixed_asset.data.default_root_state.clone()[env_ids] # (7)
-        robot_pose = self._robot.data.default_root_state.clone()[env_ids] # 8
+        robot_pose = self._robot.data.default_joint_pos.clone()[env_ids] # 8
+
+        # reset progression buffer of all environments reset
+        self.progression[env_ids] = 0 # set back to incomplete
+
+        self._set_assets_to_default_pose(env_ids=env_ids, held_state=held_state, fixed_state=fixed_state)
+        self._set_franka_to_default_pose(joints=robot_pose, env_ids=env_ids)
+        self.step_sim_no_action()
+
+        self.randomize_initial_state(env_ids)
 
         if (self.curriculum_enabled):
-             # force X% of envrionments to be non curriculum (evals instead)
+            # force X% of envrionments to be non curriculum (evals instead)
             sample_ratio = self.cfg.sampling_ratio
 
             num_curriculum = int(len(env_ids) * sample_ratio)
@@ -803,7 +819,7 @@ class FactoryEnv(DirectRLEnv):
                 worlds = self.success_buffer[subtasks, world_ids]
                 robot_pose[picked] = worlds[:, :8]
                 held_state[picked] = worlds[:, 8:15]
-                fixed_state[picked] = worlds[:,15:22]
+                fixed_state[picked] = worlds[:, 15:22]
 
                 # optional domain randomization
                 robot_pose[picked] += sample_uniform(
@@ -812,15 +828,10 @@ class FactoryEnv(DirectRLEnv):
                     robot_pose[picked].shape,
                     self.device,
                 )
-
-        # reset progression buffer of all environments reset
-        self.progression[env_ids] = 0 # set back to incomplete
-
-        self._set_assets_to_default_pose(env_ids=env_ids, held_state=held_state, fixed_state=fixed_state)
-        self._set_franka_to_default_pose(joints=robot_pose, env_ids=env_ids)
-        self.step_sim_no_action()
-
-        self.randomize_initial_state(env_ids)
+                # should overwrite curriculum choosen environment
+                self._set_assets_to_default_pose(env_ids=env_ids, held_state=held_state, fixed_state=fixed_state)
+                self._set_franka_to_default_pose(joints=robot_pose, env_ids=env_ids)
+            
         
         if hasattr(self, "extras") and "log" in self.extras:
             variance = (robot_pose - self._robot.data.default_joint_pos[env_ids]).pow(2).mean() # mean squared difference
@@ -927,9 +938,8 @@ class FactoryEnv(DirectRLEnv):
     def _set_franka_to_default_pose(self, joints, env_ids):
         """Return Franka to its default joint position."""
         gripper_width = self.cfg_task.held_asset_cfg.diameter / 2 * 1.25
-        joint_pos = self._robot.data.default_joint_pos[env_ids]
-        joint_pos[:, 7:] = gripper_width  # MIMIC
-        joint_pos[:, :7] = joints[None, :]
+        joint_pos = self._robot.data.default_joint_pos[env_ids].clone()
+        joint_pos[:] = joints
         joint_vel = torch.zeros_like(joint_pos)
         joint_effort = torch.zeros_like(joint_pos)
         self.ctrl_target_joint_pos[env_ids, :] = joint_pos
