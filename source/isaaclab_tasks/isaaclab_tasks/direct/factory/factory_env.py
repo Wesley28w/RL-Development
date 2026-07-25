@@ -37,12 +37,12 @@ class FactoryEnv(DirectRLEnv):
         self._init_tensors()
         self._set_default_dynamics_parameters()
 
-        self.progression = torch.zeros([self.num_envs, 3, 23], device=self.device) # 3 subtasks and 23 for (completed, pose)
+        self.progression = torch.zeros([self.num_envs, 3, 24], device=self.device) # 3 subtasks and 24 for (completed, pose)
         self.success_rate = torch.zeros(3, device=self.device) # 3 is number of subtasks
 
         self.distribution = torch.softmax(torch.ones([3], device=self.device), dim=0)
 
-        self.success_buffer = torch.zeros([3, self.cfg.success_buffer_size, 22], device=self.device) # 7 for fixed, 7 for grasped, 8 for robot joints
+        self.success_buffer = torch.zeros([3, self.cfg.success_buffer_size, 23], device=self.device) # 9 for robot joints, 7 for held, 7 for fixed
 
         self.pose_buffer_idx = torch.zeros(
             3,
@@ -227,6 +227,8 @@ class FactoryEnv(DirectRLEnv):
 
         obs_tensors = factory_utils.collapse_obs_dict(obs_dict, self.cfg.obs_order + ["prev_actions"])
         state_tensors = factory_utils.collapse_obs_dict(state_dict, self.cfg.state_order + ["prev_actions"])
+        if self.curriculum_enabled and self.cfg.observation_std > 0:
+            obs_tensors = obs_tensors + torch.randn_like(obs_tensors) * self.cfg.observation_std
         return {"policy": obs_tensors, "critic": state_tensors}
 
     def _reset_buffers(self, env_ids):
@@ -240,7 +242,10 @@ class FactoryEnv(DirectRLEnv):
         if len(env_ids) > 0:
             self._reset_buffers(env_ids)
 
-        self.actions = self.ema_factor * action.clone().to(self.device) + (1 - self.ema_factor) * self.actions
+        action = action.clone().to(self.device)
+        if self.curriculum_enabled and self.cfg.action_std > 0:
+            action = action + torch.randn_like(action) * self.cfg.action_std
+        self.actions = self.ema_factor * action + (1 - self.ema_factor) * self.actions
 
     def close_gripper_in_place(self):
         """Keep gripper in current position as gripper closes."""
@@ -368,11 +373,15 @@ class FactoryEnv(DirectRLEnv):
         """
         self._compute_intermediate_values(dt=self.physics_dt)
         time_out = self.episode_length_buf >= self.max_episode_length - 1
+
+        check_rot = self.cfg_task.name == "nut_thread"
+        curr_success = self._get_curr_successes(self.cfg_task.success_threshold, check_rot=check_rot)
+        # per-env success proxy consumed by _run_curriculum_controller (mirrors franka_cabinet_env)
+        self.overall_success = curr_success.float()
+
         if hasattr(self, "extras") and "log" in self.extras:
-            check_rot = self.cfg_task.name == "nut_thread"
-            curr_success = self._get_curr_successes(self.cfg_task.success_threshold, check_rot=check_rot)
             L = self.extras["log"]
-            L["dones/success_rate"] = curr_success.float().mean().item()
+            L["dones/success_rate"] = self.overall_success.mean().item()
         return time_out, time_out
 
     def _get_curr_successes(self, success_threshold, check_rot=False):
@@ -454,12 +463,12 @@ class FactoryEnv(DirectRLEnv):
 
     def _get_world(self) -> torch.Tensor:
         return torch.cat([
-            self._robot.data.joint_pos, # (8)   
-            self._held_asset.data.root_pos_w, # (3)
+            self._robot.data.joint_pos, # (9)
+            self._held_asset.data.root_pos_w - self.scene.env_origins, # (3)
             self._held_asset.data.root_quat_w, # (4)
-            self._fixed_asset.data.root_pos_w, # (3)
+            self._fixed_asset.data.root_pos_w - self.scene.env_origins, # (3)
             self._fixed_asset.data.root_quat_w, # (4)
-        ])
+        ], dim=1)
     
     def _update_progression(self):
         completions = self._get_subtasks() # which are completed 
@@ -764,7 +773,7 @@ class FactoryEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
         held_state = self._held_asset.data.default_root_state.clone()[env_ids] # (7)
         fixed_state = self._fixed_asset.data.default_root_state.clone()[env_ids] # (7)
-        robot_pose = self._robot.data.default_joint_pos.clone()[env_ids] # 8
+        robot_pose = self._robot.data.default_joint_pos.clone()[env_ids] # 9
 
         # reset progression buffer of all environments reset
         self.progression[env_ids] = 0 # set back to incomplete
@@ -793,6 +802,8 @@ class FactoryEnv(DirectRLEnv):
             self.curriculum_subtask[env_ids] = -1
 
             if picked.any():
+                picked_env_ids = env_ids[picked]
+
                 # sample subtasks
                 subtasks = torch.multinomial(
                     self.distribution,
@@ -800,16 +811,9 @@ class FactoryEnv(DirectRLEnv):
                     replacement=True,
                 )
 
-                self.curriculum_subtask[env_ids[picked]] = subtasks
-                
-                # subtasks = torch.full(
-                #     (int(picked.sum().item()),),
-                #     2,
-                #     device=self.device,
-                #     dtype=torch.long,
-                # )
+                self.curriculum_subtask[picked_env_ids] = subtasks
 
-                # sample stored worlds
+                # sample stored worlds (env-local poses; buffer is shared across envs)
                 world_ids = torch.randint(
                     0,
                     self.cfg.success_buffer_size,
@@ -817,20 +821,29 @@ class FactoryEnv(DirectRLEnv):
                     device=self.device,
                 )
                 worlds = self.success_buffer[subtasks, world_ids]
-                robot_pose[picked] = worlds[:, :8]
-                held_state[picked] = worlds[:, 8:15]
-                fixed_state[picked] = worlds[:, 15:22]
 
+                curriculum_robot_pose = worlds[:, :9]
                 # optional domain randomization
-                robot_pose[picked] += sample_uniform(
+                curriculum_robot_pose = curriculum_robot_pose + sample_uniform(
                     -self.cfg.curriculum_dr,
                     self.cfg.curriculum_dr,
-                    robot_pose[picked].shape,
+                    curriculum_robot_pose.shape,
                     self.device,
                 )
-                # should overwrite curriculum choosen environment
-                self._set_assets_to_default_pose(env_ids=env_ids, held_state=held_state, fixed_state=fixed_state)
-                self._set_franka_to_default_pose(joints=robot_pose, env_ids=env_ids)
+                robot_pose[picked] = curriculum_robot_pose
+
+                # build fresh (un-offset) default root states so env_origins is only added once below
+                curriculum_held_state = self._held_asset.data.default_root_state.clone()[picked_env_ids]
+                curriculum_held_state[:, 0:7] = worlds[:, 9:16]
+                curriculum_fixed_state = self._fixed_asset.data.default_root_state.clone()[picked_env_ids]
+                curriculum_fixed_state[:, 0:7] = worlds[:, 16:23]
+
+                # only overwrite the curriculum-chosen environments; the rest keep the
+                # domain-randomized/grasped state that randomize_initial_state() set up above
+                self._set_assets_to_default_pose(
+                    env_ids=picked_env_ids, held_state=curriculum_held_state, fixed_state=curriculum_fixed_state
+                )
+                self._set_franka_to_default_pose(joints=curriculum_robot_pose, env_ids=picked_env_ids)
             
         
         if hasattr(self, "extras") and "log" in self.extras:
@@ -936,10 +949,20 @@ class FactoryEnv(DirectRLEnv):
         return held_asset_relative_pos, held_asset_relative_quat
 
     def _set_franka_to_default_pose(self, joints, env_ids):
-        """Return Franka to its default joint position."""
+        """Return Franka to its default joint position.
+
+        `joints` may either be a shared 7-dim arm-only pose (gripper is forced to
+        `gripper_width`), or a full per-env joint tensor covering all robot DOFs
+        (e.g. a curriculum-replayed pose, which already includes the gripper).
+        """
         gripper_width = self.cfg_task.held_asset_cfg.diameter / 2 * 1.25
         joint_pos = self._robot.data.default_joint_pos[env_ids].clone()
-        joint_pos[:] = joints
+        joints = torch.as_tensor(joints, device=self.device, dtype=joint_pos.dtype)
+        if joints.dim() == 1 and joints.shape[0] == 7:
+            joint_pos[:, :7] = joints
+            joint_pos[:, 7:] = gripper_width
+        else:
+            joint_pos[:] = joints
         joint_vel = torch.zeros_like(joint_pos)
         joint_effort = torch.zeros_like(joint_pos)
         self.ctrl_target_joint_pos[env_ids, :] = joint_pos
