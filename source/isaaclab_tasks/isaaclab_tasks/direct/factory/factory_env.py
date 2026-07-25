@@ -49,6 +49,10 @@ class FactoryEnv(DirectRLEnv):
             dtype=torch.long,
             device=self.device
         )
+        # how many valid (actually-written) entries exist per subtask; slots beyond
+        # this are still the zero-init default and must not be sampled/replayed
+        # (an all-zero quaternion is not a valid rotation and will crash the GPU sim)
+        self.pose_buffer_count = torch.zeros(3, dtype=torch.long, device=self.device)
 
         self.is_curriculum_episode = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
@@ -517,6 +521,9 @@ class FactoryEnv(DirectRLEnv):
                     self.pose_buffer_idx[task] = (
                         start + count
                     ) % self.cfg.success_buffer_size
+                    self.pose_buffer_count[task] = torch.clamp(
+                        self.pose_buffer_count[task] + count, max=self.cfg.success_buffer_size
+                    )
 
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
@@ -533,6 +540,21 @@ class FactoryEnv(DirectRLEnv):
             for i in range(3):
                 L[f"subtasks/success_{i+1}"] = success[:, i].mean().item()
             L["env_compare/highest_subtask"] = highest.mean().item()
+
+            # Pre-seed every key logged below with a default value. rl_games' algo
+            # observer assumes the set of logged keys is identical on every step it
+            # samples; a key that's only added conditionally (e.g. only on steps where
+            # some mask is non-empty) will eventually cause a KeyError once a later
+            # step's info dict is missing it.
+            L["env_compare/eval_success_mean"] = 0.0
+            L["env_compare/replay_success_mean"] = 0.0
+            L["env_compare/replay_task_success_gap_mean"] = 0.0
+            for i in range(3):
+                L[f"env_compare/eval_success_{i+1}"] = 0.0
+                L[f"env_compare/replay_success_{i+1}"] = 0.0
+                L[f"env_compare/replay_task_success_{i+1}"] = 0.0
+                L[f"env_compare/replay_task_success_gap_{i+1}"] = 0.0
+                L[f"env_compare/replay_count_{i+1}"] = 0
 
             # eval for computing difficulty
             if eval_mask.any():
@@ -554,6 +576,7 @@ class FactoryEnv(DirectRLEnv):
             for task in range(3):
                 mask = (curriculum_mask & (self.curriculum_subtask == task))
 
+                L[f"env_compare/replay_count_{task+1}"] = mask.sum().item()
                 if mask.any():
                     replay_task_success = success[mask, task].mean()
                     L[f"env_compare/replay_task_success_{task+1}"] = (replay_task_success.item())
@@ -564,16 +587,26 @@ class FactoryEnv(DirectRLEnv):
                 L["env_compare/replay_task_success_gap_mean"] = (gap.mean().item())
                 for i in range(3):
                     L[f"env_compare/replay_task_success_gap_{i+1}"] = (gap[i].item())
-            # sample counting
-            L[f"env_compare/replay_count_{task+1}"] = mask.sum().item()
 
     def _update_distribution(self):
         # mask to remove curriculum episodes from compute
         mask = ~self.is_curriculum_episode
-        # edge case where every env is curriculum
+        # edge case where every env is curriculum: keep the existing distribution/success_rate,
+        # but still log every step so the extras/log key schema stays consistent (rl_games
+        # assumes the same keys are present in every logged info dict)
         if mask.sum() == 0:
+            if hasattr(self, "extras") and "log" in self.extras:
+                L = self.extras["log"]
+                L["curriculum/blend"] = 0.0
+                L["curriculum/margin"] = 0.0
+                L["curriculum/selected"] = -1
+                for i in range(3):
+                    L[f"curriculum/success_rate_{i+1}"] = self.success_rate[i].item()
+                    L[f"curriculum/difficulty_{i+1}"] = 1.0 - self.success_rate[i].item()
+                    L[f"curriculum/distribution_{i+1}"] = self.distribution[i].item()
+                    L[f"curriculum/gap_{i+1}"] = 0.0
             return
-        
+
         batch_success = (self.progression[mask, :, 0].float().mean(dim=0))
 
         # ema on the success rate to filter noise
@@ -795,6 +828,12 @@ class FactoryEnv(DirectRLEnv):
             picked = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
             picked[perm[:num_curriculum]] = True
 
+            # subtasks with no recorded successes yet still hold their zero-init buffer
+            # rows (e.g. an all-zero quaternion), which is not a valid pose to replay
+            valid_subtasks = self.pose_buffer_count > 0
+            if not valid_subtasks.any():
+                picked[:] = False
+
             # update what episodes are actively using the curriculum
             self.is_curriculum_episode[env_ids] = False
             self.is_curriculum_episode[env_ids[picked]] = True
@@ -804,22 +843,31 @@ class FactoryEnv(DirectRLEnv):
             if picked.any():
                 picked_env_ids = env_ids[picked]
 
-                # sample subtasks
+                # sample subtasks, restricted to ones that actually have recorded poses
+                masked_distribution = torch.where(
+                    valid_subtasks, self.distribution, torch.zeros_like(self.distribution)
+                )
+                mass = masked_distribution.sum()
+                if mass <= 0:
+                    # the curriculum's preferred subtask(s) have no recorded poses yet
+                    # (e.g. distribution has fully committed to a subtask with count == 0);
+                    # fall back to uniform sampling over whichever subtasks do have data
+                    masked_distribution = valid_subtasks.float()
+                    mass = masked_distribution.sum()
+                masked_distribution = masked_distribution / mass
                 subtasks = torch.multinomial(
-                    self.distribution,
+                    masked_distribution,
                     int(picked.sum().item()), # change value to 0 for reset always to subtask 1, value to 1 for reset always to subtask 2, etc
                     replacement=True,
                 )
 
                 self.curriculum_subtask[picked_env_ids] = subtasks
 
-                # sample stored worlds (env-local poses; buffer is shared across envs)
-                world_ids = torch.randint(
-                    0,
-                    self.cfg.success_buffer_size,
-                    (int(picked.sum().item()),),
-                    device=self.device,
-                )
+                # sample stored worlds (env-local poses; buffer is shared across envs),
+                # clamped to the slots that have actually been written for that subtask
+                max_valid = self.pose_buffer_count[subtasks].clamp(min=1)
+                world_ids = (torch.rand(int(picked.sum().item()), device=self.device) * max_valid.float()).long()
+                world_ids = world_ids.clamp(max=self.cfg.success_buffer_size - 1)
                 worlds = self.success_buffer[subtasks, world_ids]
 
                 curriculum_robot_pose = worlds[:, :9]
