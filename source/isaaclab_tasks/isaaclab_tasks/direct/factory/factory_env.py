@@ -813,6 +813,12 @@ class FactoryEnv(DirectRLEnv):
         held_state = self._held_asset.data.default_root_state.clone()[env_ids] # (7)
         fixed_state = self._fixed_asset.data.default_root_state.clone()[env_ids] # (7)
         robot_pose = self._robot.data.default_joint_pos.clone()[env_ids] # 9
+        # base reset pose is the configured arm reset pose (not the articulation's
+        # default_joint_pos), matching the original non-curriculum reset behavior;
+        # curriculum-picked envs overwrite this below with a replayed pose
+        gripper_width = self.cfg_task.held_asset_cfg.diameter / 2 * 1.25
+        robot_pose[:, :7] = torch.tensor(self.cfg.ctrl.reset_joints, device=self.device, dtype=robot_pose.dtype)
+        robot_pose[:, 7:] = gripper_width
 
         # reset progression buffer of all environments reset
         self.progression[env_ids] = 0 # set back to incomplete
