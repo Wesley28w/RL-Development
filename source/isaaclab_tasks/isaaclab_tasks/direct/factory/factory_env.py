@@ -447,11 +447,11 @@ class FactoryEnv(DirectRLEnv):
         
         pitch = self.cfg_task.fixed_asset_cfg.thread_pitch
         # aligned with the screw
-        aligned = ((xy_dist < 0.0025)& (z_disp < pitch * 0.1))
+        aligned = (xy_dist < 0.0025)
         # one threaded down
-        one_thread = ((xy_dist < 0.0025)& (z_disp < pitch * 1.0))
+        one_thread = ((xy_dist < 0.0025) & (z_disp < pitch * 1.0))
         # one and a half thread
-        one_half_thread = ((xy_dist < 0.0025)& (z_disp < pitch * 1.5))
+        one_half_thread = ((xy_dist < 0.0025) & (z_disp < pitch * 1.5))
 
         _, _, curr_yaw = torch_utils.get_euler_xyz(self.fingertip_midpoint_quat)
         curr_yaw = factory_utils.wrap_yaw(curr_yaw)
@@ -462,6 +462,12 @@ class FactoryEnv(DirectRLEnv):
         aligned &= is_rotated
         one_thread &= is_rotated
         one_half_thread &= is_rotated
+
+        if hasattr(self, "extras") and "log" in self.extras:
+            L = self.extras["log"]
+            L["debug/z_disp_mean"] = z_disp.mean().item()
+            L["debug/z_disp_min"] = z_disp.min().item()
+            L["debug/z_disp_max"] = z_disp.max().item()
 
         return torch.stack([aligned, one_thread, one_half_thread], dim=1)
 
