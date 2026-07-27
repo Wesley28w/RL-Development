@@ -443,33 +443,26 @@ class FactoryEnv(DirectRLEnv):
             self.device,
         )
         xy_dist = torch.linalg.vector_norm(target_held_base_pos[:, 0:2] - held_base_pos[:, 0:2], dim=1)
-        z_disp = held_base_pos[:, 2] - target_held_base_pos[:, 2]
-        
-        pitch = self.cfg_task.fixed_asset_cfg.thread_pitch
-        # aligned with the screw
-        aligned = (xy_dist < 0.0025)
-        # one threaded down
-        one_thread = ((xy_dist < 0.0025) & (z_disp < pitch * 1.0))
-        # one and a half thread
-        one_half_thread = ((xy_dist < 0.0025) & (z_disp < pitch * 1.5))
 
         _, _, curr_yaw = torch_utils.get_euler_xyz(self.fingertip_midpoint_quat)
         curr_yaw = factory_utils.wrap_yaw(curr_yaw)
 
         is_rotated = curr_yaw < self.cfg_task.ee_success_yaw
 
-        # consider rotation
-        aligned &= is_rotated
-        one_thread &= is_rotated
-        one_half_thread &= is_rotated
+        # aligned with the screw
+        aligned = (xy_dist < 0.001) & is_rotated # make slightly less than 0.0025 for bigger subtask 1 to subtask 2 gap
+        # one threaded down
+        engaged = self._get_curr_successes(self.cfg_task.engage_threshold, check_rot=False)
+        # one and a half thread
+        success = self._get_curr_successes(self.cfg_task.success_threshold, check_rot=True)
 
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
-            L["debug/z_disp_mean"] = z_disp.mean().item()
-            L["debug/z_disp_min"] = z_disp.min().item()
-            L["debug/z_disp_max"] = z_disp.max().item()
+            L["subtasks/aligned"] = aligned.float().mean().item()
+            L["subtasks/engaged"] = engaged.float().mean().item()
+            L["subtasks/success"] = success.float().mean().item()
 
-        return torch.stack([aligned, one_thread, one_half_thread], dim=1)
+        return torch.stack([aligned, engaged, success], dim=1)
 
     def _get_world(self) -> torch.Tensor:
         return torch.cat([
