@@ -717,7 +717,8 @@ class FactoryEnv(DirectRLEnv):
         # # custom curriclum work
         self._update_progression() # update data each step
         # uses the updated progressions
-        self._update_distribution()
+        if self.common_step_counter % 10 == 0:
+            self._update_distribution()
 
         # Get successful and failed envs at current timestep
         check_rot = self.cfg_task.name == "nut_thread"
