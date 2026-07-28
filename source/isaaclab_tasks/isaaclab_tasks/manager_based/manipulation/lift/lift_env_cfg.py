@@ -130,6 +130,13 @@ class EventCfg:
         },
     )
 
+    # success-replay auto-curriculum (see mdp/curriculum.py): allocates the shared curriculum
+    # state once at startup, and one-time overwrites the curriculum-picked subset of resetting
+    # envs on top of the two reset events above, so it must stay declared last.
+    init_success_curriculum = EventTerm(func=mdp.init_success_curriculum, mode="startup")
+
+    reset_success_curriculum = EventTerm(func=mdp.reset_success_curriculum, mode="reset")
+
 
 @configclass
 class RewardsCfg:
@@ -159,6 +166,12 @@ class RewardsCfg:
         weight=-1e-4,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
+
+    # success-replay auto-curriculum bookkeeping (see mdp/curriculum.py). Always returns zero
+    # reward - it exists purely for its side effects (subtask tracking, replay buffer, sampling
+    # distribution) - but needs a nonzero weight, since the reward manager skips calling any term
+    # whose weight is exactly 0.0.
+    update_success_progression = RewTerm(func=mdp.update_success_progression, weight=1.0)
 
 
 @configclass
@@ -205,6 +218,30 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventCfg = EventCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
+
+    # --- success-replay auto-curriculum (custom, see mdp/curriculum.py) ---
+    reset_state_curriculum_enabled: bool = True
+    success_buffer_size: int = 64
+    prob_exp: float = 2.0  # how much to sharpen the sampling distribution (1 = no sharpening)
+    sampling_ratio: float = 0.3  # fraction of resets that replay a curriculum-sampled state
+    curriculum_dr: float = 0.02  # domain randomization applied to replayed robot joint pos
+    success_rate_alpha: float = 0.05  # EMA momentum for the per-subtask success rate
+    greedy_margin: float = 0.10  # top-2 margin (in normalized gap units) that saturates to greedy
+    curriculum_total_iterations: int = 2_000_000  # raw env-step count defining "fully progressed"; tune per run length
+    controller_enabled: bool = False  # auto-disable curriculum once success stops improving
+    window_analysis_size: float = 0.02  # fraction of curriculum_total_iterations per analysis window
+    window_analysis_start: float = 0.01  # fraction of curriculum_total_iterations before first snapshot
+    slope_threshold: float = 2.0  # success-rate slope below which the controller disables curriculum
+
+    # --- subtask completion thresholds (tunable) ---
+    curriculum_reach_dist: float = 0.10  # subtask 1: ee-to-object distance (m)
+    curriculum_grasp_dist: float = 0.03  # subtask 2: ee-to-object distance (m)
+    curriculum_gripper_closed_thresh: float = 0.02  # subtask 2: finger joint pos below this = "closed"
+    curriculum_gripper_open_thresh: float = 0.03  # subtask 5: finger joint pos above this = "released"
+    curriculum_lift_height: float = 0.15  # subtask 3/4: object world z (m)
+    curriculum_orient_tol: float = 0.30  # subtask 4/5: quat_error_magnitude tolerance (rad, ~17 deg)
+    curriculum_place_pos_tol: float = 0.05  # subtask 5: distance to commanded object_pose (m)
+    curriculum_gripper_joint_names: list[str] = ["panda_finger_joint.*"]  # overridden per-robot in agent cfgs
 
     def __post_init__(self):
         """Post initialization."""

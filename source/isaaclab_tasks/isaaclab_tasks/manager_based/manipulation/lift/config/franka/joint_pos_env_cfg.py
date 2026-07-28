@@ -43,6 +43,9 @@ class FrankaCubeLiftEnvCfg(LiftEnvCfg):
         # Set the body name for the end effector
         self.commands.object_pose.body_name = "panda_hand"
 
+        # Curriculum's grasp/place subtask checks read these specific joint names for this robot
+        self.curriculum_gripper_joint_names = ["panda_finger_joint1", "panda_finger_joint2"]
+
         # Set Cube as object
         self.scene.object = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/Object",
