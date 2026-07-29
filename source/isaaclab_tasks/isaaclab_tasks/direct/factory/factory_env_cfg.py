@@ -192,12 +192,12 @@ class FactoryEnvCfg(DirectRLEnvCfg):
     # custom hyperparameters
     success_buffer_size = 64
     prob_exp = 2 # how much we sharpen the probability distribution (1 = No sharpening)
-    sampling_ratio = 0.5 # what fraction of resets go to the sample distribution
-    curriculum_dr = 0.02 # how much domain randomization to apply to robot joints
+    sampling_ratio = 0.3 # what fraction of resets go to the sample distribution
+    curriculum_dr = 0.00 # how much domain randomization to apply to robot joints
     success_rate_alpha = 0.05 # momentum control of success rate movement (pre-calculations)
     greedy_margin = 0.10 # controls the margin between top and second distribution value that enables softmax
     action_std = 0.000 # action noise for curriculum environments
-    observation_std = 0.005 # noise added for curriculum environments
+    observation_std = 0.000 # noise added for curriculum environments
 
     # policy params
     curriculum_total_iterations = 200 # rl_games does it differenlty
