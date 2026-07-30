@@ -68,7 +68,6 @@ def _get_subtasks(env: ManagerBasedRLEnv) -> torch.Tensor:
 
     gripper_pos = robot.data.joint_pos[:, C.gripper_joint_ids]
     gripper_closed = (gripper_pos < env.cfg.curriculum_gripper_closed_thresh).all(dim=-1)
-    gripper_open = (gripper_pos > env.cfg.curriculum_gripper_open_thresh).all(dim=-1)
 
     orient_err = quat_error_magnitude(obj_quat, _identity_quat(env.num_envs, env.device))
 
@@ -88,12 +87,14 @@ def _get_subtasks(env: ManagerBasedRLEnv) -> torch.Tensor:
     sub_task_3 = grasped & (obj_pos[:, 2] > env.cfg.curriculum_lift_height)
     # 4. orient it upright in the air: still holding it, still lifted, AND close to its upright (spawn) orientation
     sub_task_4 = grasped & (obj_pos[:, 2] > env.cfg.curriculum_lift_height) & (orient_err < env.cfg.curriculum_orient_tol)
-    # 5. place it upright at the target: near the commanded goal, upright, and released
-    sub_task_5 = (
-        (goal_dist < env.cfg.curriculum_place_pos_tol)
-        & (orient_err < env.cfg.curriculum_orient_tol)
-        & gripper_open
-    )
+    # 5. place it upright at the target: still holding it steady, close to the commanded goal,
+    # AND upright. Deliberately does not require releasing the gripper here - the base reward set
+    # (object_goal_distance/object_is_lifted) never rewards releasing near the goal, so requiring
+    # it made this subtask nearly unreachable regardless of training time (confirmed empirically:
+    # curriculum-off baseline runs at both 1500 and 15000 iterations still saw ~0 success). "Placed"
+    # is instead defined as "held steady at the goal, upright" - the behavior the reward actually
+    # teaches - rather than a release event the policy has no incentive to ever perform.
+    sub_task_5 = grasped & (goal_dist < env.cfg.curriculum_place_pos_tol) & (orient_err < env.cfg.curriculum_orient_tol)
 
     return torch.stack([sub_task_1, sub_task_2, sub_task_3, sub_task_4, sub_task_5], dim=1)
 
@@ -214,6 +215,11 @@ class init_success_curriculum(ManagerTermBase):
         self.last_reset_distance = 0.0
         self.last_reset_variance = 0.0
         self.last_sample_rate = 0.0
+        # episode-outcome breakdown (subtask-independent): what fraction of the last batch of
+        # resetting envs actually finished the whole task vs ran out of time vs dropped the object
+        self.last_episode_success_rate = 0.0
+        self.last_episode_timeout_rate = 0.0
+        self.last_episode_dropped_rate = 0.0
 
         env.lift_curriculum = self
 
@@ -308,6 +314,14 @@ def update_success_progression(env: ManagerBasedRLEnv) -> torch.Tensor:
         L["curriculum/reset_distance"] = C.last_reset_distance
         L["curriculum/reset_variance"] = C.last_reset_variance
 
+        # episode-outcome breakdown, independent of which subtask(s) were touched: of the envs
+        # that just reset, how many actually completed the full task vs timed out vs dropped the
+        # object. Unlike `subtasks/success_5`, which is a per-step sticky average across ALL envs,
+        # this is computed once per episode boundary from the actual termination reason.
+        L["episode_outcome/success_rate"] = C.last_episode_success_rate
+        L["episode_outcome/timeout_rate"] = C.last_episode_timeout_rate
+        L["episode_outcome/dropped_rate"] = C.last_episode_dropped_rate
+
         L["controller/curriculum_enabled"] = int(C.curriculum_enabled)
         L["controller/first_snapshot_taken"] = 0.0 if C.controller_snapshot is None else C.controller_snapshot
         L["controller/second_snapshot_taken"] = (
@@ -401,5 +415,16 @@ def reset_success_curriculum(env: ManagerBasedRLEnv, env_ids: torch.Tensor):
             C.last_reset_distance = distance.mean().item()
             C.last_reset_variance = variance.item()
             C.last_sample_rate = picked.float().mean().item()
+
+    # episode-outcome breakdown, captured before progression is cleared below. Valid here because
+    # `env.termination_manager.compute()` runs earlier this same step (before `_reset_idx`, which
+    # is what invokes this event term) and its per-term `terminated`/`time_outs` buffers aren't
+    # touched again until `termination_manager.reset()`, which runs *after* all reset event terms.
+    episode_success = C.progression[env_ids, -1]
+    timed_out = env.termination_manager.time_outs[env_ids]
+    dropped = env.termination_manager.terminated[env_ids]
+    C.last_episode_success_rate = episode_success.float().mean().item()
+    C.last_episode_timeout_rate = timed_out.float().mean().item()
+    C.last_episode_dropped_rate = dropped.float().mean().item()
 
     C.progression[env_ids] = False

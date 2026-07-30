@@ -242,7 +242,6 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     # holding it, not near 0. Set too low (e.g. 0.02, ~= this cube's half-width), a genuine grasp
     # almost never registers as "closed" - tune empirically if grasp success stays near zero.
     curriculum_gripper_closed_thresh: float = 0.026
-    curriculum_gripper_open_thresh: float = 0.03  # subtask 5: finger joint pos above this = "released"
     curriculum_lift_height: float = 0.15  # subtask 3/4: object world z (m)
     curriculum_orient_tol: float = 0.30  # subtask 4/5: quat_error_magnitude tolerance (rad, ~17 deg)
     curriculum_place_pos_tol: float = 0.05  # subtask 5: distance to commanded object_pose (m)
