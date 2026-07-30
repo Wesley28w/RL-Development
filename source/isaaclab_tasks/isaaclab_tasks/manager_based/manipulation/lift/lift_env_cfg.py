@@ -220,7 +220,7 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     curriculum: CurriculumCfg = CurriculumCfg()
 
     # --- success-replay auto-curriculum (custom, see mdp/curriculum.py) ---
-    reset_state_curriculum_enabled: bool = True
+    reset_state_curriculum_enabled: bool = False
     success_buffer_size: int = 64
     prob_exp: float = 2.0  # how much to sharpen the sampling distribution (1 = no sharpening)
     sampling_ratio: float = 0.3  # fraction of resets that replay a curriculum-sampled state
@@ -236,7 +236,12 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     # --- subtask completion thresholds (tunable) ---
     curriculum_reach_dist: float = 0.10  # subtask 1: ee-to-object distance (m)
     curriculum_grasp_dist: float = 0.03  # subtask 2: ee-to-object distance (m)
-    curriculum_gripper_closed_thresh: float = 0.02  # subtask 2: finger joint pos below this = "closed"
+    # subtask 2/3/4: finger joint pos below this = "closed". Must sit above the grasped object's
+    # half-width: the gripper actuator's close target is 0.0, but a rigid, non-compliant object
+    # physically blocks the finger, so the joint settles at ~half the object's width while actually
+    # holding it, not near 0. Set too low (e.g. 0.02, ~= this cube's half-width), a genuine grasp
+    # almost never registers as "closed" - tune empirically if grasp success stays near zero.
+    curriculum_gripper_closed_thresh: float = 0.026
     curriculum_gripper_open_thresh: float = 0.03  # subtask 5: finger joint pos above this = "released"
     curriculum_lift_height: float = 0.15  # subtask 3/4: object world z (m)
     curriculum_orient_tol: float = 0.30  # subtask 4/5: quat_error_magnitude tolerance (rad, ~17 deg)

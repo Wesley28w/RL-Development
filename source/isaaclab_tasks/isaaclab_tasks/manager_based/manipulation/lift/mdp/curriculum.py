@@ -80,11 +80,14 @@ def _get_subtasks(env: ManagerBasedRLEnv) -> torch.Tensor:
     # 1. move close to the cube
     sub_task_1 = ee_dist < env.cfg.curriculum_reach_dist
     # 2. grasp the cube: close to it AND fingers closed around it
-    sub_task_2 = (ee_dist < env.cfg.curriculum_grasp_dist) & gripper_closed
-    # 3. lift it up: clearly above the table/grasp-jitter range
-    sub_task_3 = obj_pos[:, 2] > env.cfg.curriculum_lift_height
-    # 4. orient it upright in the air: still lifted AND close to its upright (spawn) orientation
-    sub_task_4 = (obj_pos[:, 2] > env.cfg.curriculum_lift_height) & (orient_err < env.cfg.curriculum_orient_tol)
+    grasped = (ee_dist < env.cfg.curriculum_grasp_dist) & gripper_closed
+    sub_task_2 = grasped
+    # 3. lift it up: still holding it (unlike a drawer joint, a free cube can be knocked above the
+    # height threshold without being grasped, so this must be gated on `grasped` or it silently
+    # decouples from subtask 2 and breaks the monotonic success cascade _update_distribution relies on)
+    sub_task_3 = grasped & (obj_pos[:, 2] > env.cfg.curriculum_lift_height)
+    # 4. orient it upright in the air: still holding it, still lifted, AND close to its upright (spawn) orientation
+    sub_task_4 = grasped & (obj_pos[:, 2] > env.cfg.curriculum_lift_height) & (orient_err < env.cfg.curriculum_orient_tol)
     # 5. place it upright at the target: near the commanded goal, upright, and released
     sub_task_5 = (
         (goal_dist < env.cfg.curriculum_place_pos_tol)
