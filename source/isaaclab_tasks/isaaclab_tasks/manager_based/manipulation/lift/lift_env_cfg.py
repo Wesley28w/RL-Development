@@ -184,6 +184,13 @@ class CurriculumCfg:
         func=mdp.modify_reward_weight, params={"term_name": "joint_vel", "weight": -1e-1, "num_steps": 10000}
     )
 
+    # logs a raw (unsmoothed) 0-1 success rate for lifting the object to its target pose, to TensorBoard
+    # under "Curriculum/lift_success_rate". Read-only: it does not modify any environment parameter, reward,
+    # observation, or termination, so it has no effect on training.
+    lift_success_rate = CurrTerm(
+        func=mdp.lift_success_rate, params={"command_name": "object_pose", "threshold": 0.02}
+    )
+
 
 ##
 # Environment configuration
