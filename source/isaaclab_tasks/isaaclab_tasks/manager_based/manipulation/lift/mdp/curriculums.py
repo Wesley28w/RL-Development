@@ -54,3 +54,24 @@ def lift_success_rate(
     )
     distance = torch.norm(des_pos_w - object.data.root_pos_w[env_ids], dim=1)
     return (distance < threshold).float().mean()
+
+
+def reset_pose_curriculum_metrics(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    tracker_term_name: str = "subtask_progression_tracker",
+) -> dict[str, float]:
+    """Surfaces the reset-pose curriculum's internal bookkeeping (see ``mdp/events.py``) to TensorBoard.
+
+    This reaches into the :class:`isaaclab_tasks.manager_based.manipulation.lift.mdp.events.subtask_progression_tracker`
+    event term (the same reflection pattern dexsuite's ``DifficultyScheduler``/``initial_final_interpolate_fn``
+    use to share state between terms) and returns its latest cached stats dict, which the curriculum manager
+    logs under ``Curriculum/reset_pose_curriculum_metrics/<key>``. Returns an empty dict (nothing logged) when
+    the curriculum is disabled, matching that term's own no-op behavior.
+    """
+    if not env.cfg.reset_state_curriculum_enabled:
+        return {}
+    # subtask_progression_tracker is registered as a reward term (see mdp/events.py's module docstring for
+    # why), so it must be looked up through the reward manager rather than the event manager.
+    tracker = getattr(env.reward_manager.cfg, tracker_term_name).func
+    return dict(tracker._log)

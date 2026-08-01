@@ -130,6 +130,17 @@ class EventCfg:
         },
     )
 
+    # reset-pose curriculum (see mdp/events.py for the full explanation, including why the tracker that this
+    # depends on is registered as a reward term in RewardsCfg below rather than here as an "interval" event).
+    # Must run *after* reset_all / reset_object_position above so that, for the sampled environments, its
+    # writes are the ones that stick. Gated by `reset_state_curriculum_enabled`; when that is False (the
+    # default) this is a complete no-op -- it doesn't even draw from the random generator.
+    sample_curriculum_reset_state = EventTerm(
+        func=mdp.sample_curriculum_reset_state,
+        mode="reset",
+        params={"tracker_term_name": "subtask_progression_tracker"},
+    )
+
 
 @configclass
 class RewardsCfg:
@@ -158,6 +169,28 @@ class RewardsCfg:
         func=mdp.joint_vel_l2,
         weight=-1e-4,
         params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+
+    # reset-pose curriculum bookkeeping (see mdp/events.py). This term's return value is *always* exactly
+    # zero for every environment -- weight is set to 1.0 only because RewardManager skips calling any term
+    # whose weight is 0.0, so its actual value is irrelevant and it can never change the reward signal.
+    # Gated by `reset_state_curriculum_enabled`; a complete no-op (no scene reads, no random draws) when
+    # that is False (the default).
+    subtask_progression_tracker = RewTerm(
+        func=mdp.subtask_progression_tracker,
+        weight=1.0,
+        params={
+            "reach_threshold": 0.10,
+            "grasp_distance_threshold": 0.02,
+            "gripper_closed_threshold": 0.02,
+            "lift_height_threshold": 0.10,
+            "near_goal_threshold": 0.05,
+            "command_name": "object_pose",
+            "gripper_joint_names": ["panda_finger.*"],
+            "robot_cfg": SceneEntityCfg("robot"),
+            "object_cfg": SceneEntityCfg("object"),
+            "ee_frame_cfg": SceneEntityCfg("ee_frame"),
+        },
     )
 
 
@@ -191,6 +224,14 @@ class CurriculumCfg:
         func=mdp.lift_success_rate, params={"command_name": "object_pose", "threshold": 0.02}
     )
 
+    # surfaces the reset-pose curriculum's bookkeeping (see mdp/events.py) to TensorBoard under
+    # "Curriculum/reset_pose_curriculum_metrics/...". Logging-only: it does not modify any environment
+    # parameter, reward, observation, or termination, so it has no effect on training. Logs nothing (empty
+    # dict) while `reset_state_curriculum_enabled` is False.
+    reset_pose_curriculum_metrics = CurrTerm(
+        func=mdp.reset_pose_curriculum_metrics, params={"tracker_term_name": "subtask_progression_tracker"}
+    )
+
 
 ##
 # Environment configuration
@@ -212,6 +253,17 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventCfg = EventCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
+
+    # reset-pose curriculum (see mdp/events.py). Same field names/values as
+    # isaaclab_tasks.direct.franka_cabinet.franka_cabinet_env.FrankaCabinetEnvCfg's "custom hyperparameters",
+    # kept identical across subtasks rather than retuned per-subtask.
+    reset_state_curriculum_enabled = True  # master switch; everything below is a full no-op while this is False
+    success_buffer_size = 64
+    prob_exp = 2  # how much we sharpen the probability distribution (1 = no sharpening)
+    sampling_ratio = 0.3  # what fraction of resets go to the sampled (curriculum) distribution
+    curriculum_dr = 0.02  # how much domain randomization to apply to replayed robot joints
+    success_rate_alpha = 0.05  # momentum control of success rate movement (pre-calculations)
+    greedy_margin = 0.10  # controls the margin between top and second distribution value that enables softmax
 
     def __post_init__(self):
         """Post initialization."""
