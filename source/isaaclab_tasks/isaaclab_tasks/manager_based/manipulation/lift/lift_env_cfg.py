@@ -257,7 +257,7 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     # reset-pose curriculum (see mdp/events.py). Same field names/values as
     # isaaclab_tasks.direct.franka_cabinet.franka_cabinet_env.FrankaCabinetEnvCfg's "custom hyperparameters",
     # kept identical across subtasks rather than retuned per-subtask.
-    reset_state_curriculum_enabled = False  # master switch; everything below is a full no-op while this is False
+    reset_state_curriculum_enabled = True  # master switch; everything below is a full no-op while this is False
     success_buffer_size = 64
     prob_exp = 2  # how much we sharpen the probability distribution (1 = no sharpening)
     sampling_ratio = 0.3  # what fraction of resets go to the sampled (curriculum) distribution
