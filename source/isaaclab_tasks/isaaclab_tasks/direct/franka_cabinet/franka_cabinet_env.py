@@ -165,7 +165,7 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     sampling_ratio = 0.3 # what fraction of resets go to the sample distribution
     curriculum_dr = 0.02 # how much domain randomization to apply to robot joints
     action_std = 0.000 # action noise for curriculum environments
-    observation_std = 0.005 # noise added for curriculum environments
+    observation_std = 0.000 # noise added for curriculum environments
     success_rate_alpha = 0.05 # momentum control of success rate movement (pre-calculations)
     greedy_margin = 0.10 # controls the margin between top and second distribution value that enables softmax
     
@@ -525,9 +525,8 @@ class FrankaCabinetEnv(DirectRLEnv):
         # blend between the two
         blend = torch.clamp(margin / self.cfg.greedy_margin, 0.0, 1.0) # elegant: if margin is great than 0.1 then it will be clamped to 1.0. 
         self.distribution = soft
-        # self.distribution = ((1.0 - blend) * soft + blend * hard)
-        # self.distribution /= self.distribution.sum()
-        # self.distribution = soft
+        self.distribution = ((1.0 - blend) * soft + blend * hard)
+        self.distribution /= self.distribution.sum()
 
         # for logging
         if hasattr(self, "extras") and "log" in self.extras:
