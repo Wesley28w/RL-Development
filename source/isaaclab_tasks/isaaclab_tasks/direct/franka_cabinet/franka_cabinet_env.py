@@ -524,7 +524,7 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         # blend between the two
         blend = torch.clamp(margin / self.cfg.greedy_margin, 0.0, 1.0) # elegant: if margin is great than 0.1 then it will be clamped to 1.0. 
-        self.distribution = hard
+        self.distribution = soft
         # self.distribution = ((1.0 - blend) * soft + blend * hard)
         # self.distribution /= self.distribution.sum()
         # self.distribution = soft
