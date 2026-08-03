@@ -34,8 +34,6 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     # final testing
     reset_state_curriculum_enabled = True # True
 
-    
-    
     # simulation
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 120,
@@ -526,8 +524,9 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         # blend between the two
         blend = torch.clamp(margin / self.cfg.greedy_margin, 0.0, 1.0) # elegant: if margin is great than 0.1 then it will be clamped to 1.0. 
-        self.distribution = ((1.0 - blend) * soft + blend * hard)
-        self.distribution /= self.distribution.sum()
+        self.distribution = hard
+        # self.distribution = ((1.0 - blend) * soft + blend * hard)
+        # self.distribution /= self.distribution.sum()
         # self.distribution = soft
 
         # for logging
