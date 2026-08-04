@@ -359,7 +359,14 @@ class FrankaCabinetEnv(DirectRLEnv):
 
             # 0.0 = closed, 1.0 = fully open (39 cm)
             self.overall_success = torch.clamp(drawer_pos / 0.39, 0.0, 1.0)
-            L["dones/success_rate_margin"] = self.overall_success.mean().item()
+            # exclude environments currently replaying a reset-pose-curriculum state: they were teleported
+            # into an already-partially-open drawer, so counting them would inflate the reported success rate.
+            # There is no separate eval phase here, so this metric has to reflect only genuinely-earned
+            # progress. Fall back to the unfiltered mean on the (very unlikely, given sampling_ratio < 1) step
+            # where every single environment happens to be a curriculum replay, so the key is never dropped.
+            natural_mask = ~self.is_curriculum_episode
+            success_for_metric = self.overall_success[natural_mask] if natural_mask.any() else self.overall_success
+            L["dones/success_rate_margin"] = success_for_metric.mean().item()
 
         return terminated, truncated
 
@@ -546,7 +553,11 @@ class FrankaCabinetEnv(DirectRLEnv):
         if not self.curriculum_enabled:
             return
 
-        success = self.overall_success.mean().item() # TODO: switch to ema smoothed success_rate var
+        # same natural-only exclusion as the dones/success_rate_margin log: replayed curriculum episodes
+        # would otherwise bias the controller's enable/disable decision.
+        natural_mask = ~self.is_curriculum_episode
+        success_tensor = self.overall_success[natural_mask] if natural_mask.any() else self.overall_success
+        success = success_tensor.mean().item() # TODO: switch to ema smoothed success_rate var
 
         # Take snapshot once
         if (self.progress >= self.cfg.window_analysis_start and self.controller_snapshot is None):

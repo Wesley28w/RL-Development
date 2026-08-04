@@ -385,7 +385,14 @@ class FactoryEnv(DirectRLEnv):
 
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
-            L["dones/success_rate"] = self.overall_success.mean().item()
+            # exclude environments currently replaying a reset-pose-curriculum state: they were teleported
+            # into an already-partially-completed task, so counting them would inflate the reported success
+            # rate. There is no separate eval phase here, so this metric has to reflect only genuinely-earned
+            # progress. Fall back to the unfiltered mean on the (very unlikely, given sampling_ratio < 1) step
+            # where every single environment happens to be a curriculum replay, so the key is never dropped.
+            natural_mask = ~self.is_curriculum_episode
+            success_for_metric = self.overall_success[natural_mask] if natural_mask.any() else self.overall_success
+            L["dones/success_rate"] = success_for_metric.mean().item()
         return time_out, time_out
 
     def _get_curr_successes(self, success_threshold, check_rot=False):
@@ -663,7 +670,11 @@ class FactoryEnv(DirectRLEnv):
         if not self.curriculum_enabled:
             return
 
-        success = self.overall_success.mean().item() # TODO: switch to ema smoothed success_rate var
+        # same natural-only exclusion as the dones/success_rate log: replayed curriculum episodes would
+        # otherwise bias the controller's enable/disable decision.
+        natural_mask = ~self.is_curriculum_episode
+        success_tensor = self.overall_success[natural_mask] if natural_mask.any() else self.overall_success
+        success = success_tensor.mean().item() # TODO: switch to ema smoothed success_rate var
 
         # Take snapshot once
         if (self.progress >= self.cfg.window_analysis_start and self.controller_snapshot is None):
