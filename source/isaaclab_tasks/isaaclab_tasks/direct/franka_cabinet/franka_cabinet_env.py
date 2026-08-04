@@ -32,7 +32,7 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     state_space = 0
 
     # reset state curriculum
-    reset_state_curriculum_enabled = False # True
+    reset_state_curriculum_enabled = True # True
 
     # simulation
     sim: SimulationCfg = SimulationCfg(
