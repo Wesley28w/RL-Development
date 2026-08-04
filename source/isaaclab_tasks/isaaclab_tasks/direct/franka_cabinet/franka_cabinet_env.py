@@ -361,11 +361,6 @@ class FrankaCabinetEnv(DirectRLEnv):
             self.overall_success = torch.clamp(drawer_pos / 0.39, 0.0, 1.0)
             L["dones/success_rate_margin"] = self.overall_success.mean().item()
 
-            L["dones/success_rate_mean"] = (
-                terminated.float().sum() /
-                done.float().sum().clamp(min=1)
-            ).item()
-
         return terminated, truncated
 
     # returns each environment completion of the subtasks [N, 4]
