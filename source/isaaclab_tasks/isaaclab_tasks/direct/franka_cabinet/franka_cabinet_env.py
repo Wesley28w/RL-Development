@@ -494,9 +494,7 @@ class FrankaCabinetEnv(DirectRLEnv):
         
         batch_success = (self.progression[mask, :, 0].float().mean(dim=0))
 
-        # ema on the success rate to filter noise
-        alpha = self.cfg.success_rate_alpha
-        self.success_rate = ((1.0 - alpha) * self.success_rate + alpha * batch_success)
+        self.success_rate = batch_success
 
         # difficulty
         difficulty = 1.0 - self.success_rate # turns success rate (sr) into failure rate (fr)
@@ -644,8 +642,7 @@ class FrankaCabinetEnv(DirectRLEnv):
         cabinet = torch.zeros((len(env_ids), self._cabinet.num_joints), device=self.device)
 
         # apply curriculum
-        if (self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled) and (self.progress > 0.15):
-        #if (self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled):
+        if (self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled):
             # force X% of envrionments to be non curriculum (evals instead)
             sample_ratio = self.cfg.sampling_ratio
 
