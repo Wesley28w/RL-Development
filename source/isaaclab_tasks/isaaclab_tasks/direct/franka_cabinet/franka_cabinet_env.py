@@ -527,9 +527,8 @@ class FrankaCabinetEnv(DirectRLEnv):
 
         # blend between the two
         blend = torch.clamp(margin / self.cfg.greedy_margin, 0.0, 1.0) # elegant: if margin is great than 0.1 then it will be clamped to 1.0. 
-        self.distribution = hard
+        self.distribution = ((1.0 - blend) * soft + blend * hard)
         self.distribution /= self.distribution.sum()
-        # self.distribution = soft
 
         # for logging
         if hasattr(self, "extras") and "log" in self.extras:
@@ -645,7 +644,8 @@ class FrankaCabinetEnv(DirectRLEnv):
         cabinet = torch.zeros((len(env_ids), self._cabinet.num_joints), device=self.device)
 
         # apply curriculum
-        if (self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled):
+        if (self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled) and (self.progress > 0.15):
+        #if (self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled):
             # force X% of envrionments to be non curriculum (evals instead)
             sample_ratio = self.cfg.sampling_ratio
 
