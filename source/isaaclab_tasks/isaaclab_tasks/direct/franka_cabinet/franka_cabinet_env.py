@@ -708,8 +708,8 @@ class FrankaCabinetEnv(DirectRLEnv):
 
                 # overwrite default reset with curriculum reset
                 robot_joint_pos[picked] = worlds[:, 0:9]
-                robot_joint_vel[picked] = worlds[:9:18]
-                cabinet_joint_pos[picked] = worlds[18:22]
+                robot_joint_vel[picked] = worlds[:, 9:18]
+                cabinet_joint_pos[picked] = worlds[:, 18:22]
                 cabinet_joint_vel[picked] = worlds[:, 22:26]
 
                 # optional domain randomization
