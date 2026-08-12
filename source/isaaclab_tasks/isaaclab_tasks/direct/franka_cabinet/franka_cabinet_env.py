@@ -160,7 +160,7 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     finger_reward_scale = 2.0
 
     # custom hyperparamters
-    success_buffer_size = 128
+    success_buffer_size = 64
     prob_exp = 2 # how much we sharpen the probability distribution (1 = No sharpening)
     sampling_ratio = 0.3 # what fraction of resets go to the sample distribution
     curriculum_dr = 0.02 # how much domain randomization to apply to robot joints
