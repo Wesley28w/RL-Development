@@ -644,7 +644,7 @@ class FrankaCabinetEnv(DirectRLEnv):
         cabinet = torch.zeros((len(env_ids), self._cabinet.num_joints), device=self.device)
 
         # apply curriculum
-        if (self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled) and (self.progress > 0.15):
+        if (self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled):
         #if (self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled):
             # force X% of envrionments to be non curriculum (evals instead)
             sample_ratio = self.cfg.sampling_ratio
@@ -732,7 +732,7 @@ class FrankaCabinetEnv(DirectRLEnv):
             L["curriculum/reset_distance"] = distance.mean().item()
             L["curriculum/reset_variance"] = variance.item()
             L["curriculum/natural"] = self.is_curriculum_episode.float().mean()
-            if self.curriculum_enabled and (self.progress > 0.15):
+            if self.curriculum_enabled:
                 L["curriculum/sample_rate"] = picked.float().mean().item() # make sure we are sampling correct ratio
                 L["curriculum/sample_ratio_target"] = sample_ratio
 
