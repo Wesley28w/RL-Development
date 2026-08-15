@@ -495,8 +495,9 @@ class FrankaCabinetEnv(DirectRLEnv):
         batch_success = (self.progression[mask, :, 0].float().mean(dim=0))
 
         # ema on the success rate to filter noise
-        alpha = self.cfg.success_rate_alpha
-        self.success_rate = ((1.0 - alpha) * self.success_rate + alpha * batch_success)
+        # alpha = self.cfg.success_rate_alpha
+        # self.success_rate = ((1.0 - alpha) * self.success_rate + alpha * batch_success)
+        self.success_rate = batch_success
 
         # difficulty
         difficulty = 1.0 - self.success_rate # turns success rate (sr) into failure rate (fr)
@@ -529,8 +530,6 @@ class FrankaCabinetEnv(DirectRLEnv):
         blend = torch.clamp(margin / self.cfg.greedy_margin, 0.0, 1.0) # elegant: if margin is great than 0.1 then it will be clamped to 1.0. 
         self.distribution = ((1.0 - blend) * soft + blend * hard)
         self.distribution /= self.distribution.sum()
-
-        # self.distribution = soft
 
         # for logging
         if hasattr(self, "extras") and "log" in self.extras:
