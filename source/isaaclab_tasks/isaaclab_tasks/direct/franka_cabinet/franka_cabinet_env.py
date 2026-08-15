@@ -495,9 +495,8 @@ class FrankaCabinetEnv(DirectRLEnv):
         batch_success = (self.progression[mask, :, 0].float().mean(dim=0))
 
         # ema on the success rate to filter noise
-        # alpha = self.cfg.success_rate_alpha
-        # self.success_rate = ((1.0 - alpha) * self.success_rate + alpha * batch_success)
-        self.success_rate = batch_success
+        alpha = self.cfg.success_rate_alpha
+        self.success_rate = ((1.0 - alpha) * self.success_rate + alpha * batch_success)
 
         # difficulty
         difficulty = 1.0 - self.success_rate # turns success rate (sr) into failure rate (fr)
@@ -672,10 +671,17 @@ class FrankaCabinetEnv(DirectRLEnv):
 
             if picked.any():
                 # sample subtasks
-                subtasks = torch.multinomial(
-                    self.distribution,
-                    int(picked.sum().item()), # change value to 0 for reset always to subtask 1, value to 1 for reset always to subtask 2, etc
-                    replacement=True,
+                # subtasks = torch.multinomial(
+                #     self.distribution,
+                #     int(picked.sum().item()), # change value to 0 for reset always to subtask 1, value to 1 for reset always to subtask 2, etc
+                #     replacement=True,
+                # )
+
+                subtasks = torch.full(
+                    (int(picked.sum().item()),),
+                    2,
+                    device=self.device,
+                    dtype=torch.long,
                 )
 
                 self.curriculum_subtask[env_ids[picked]] = subtasks
