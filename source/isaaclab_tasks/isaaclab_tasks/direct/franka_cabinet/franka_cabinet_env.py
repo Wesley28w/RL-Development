@@ -487,12 +487,7 @@ class FrankaCabinetEnv(DirectRLEnv):
 
     def _update_distribution(self):
         # mask to remove curriculum episodes from compute
-        mask = ~self.is_curriculum_episode
-        # edge case where every env is curriculum
-        if mask.sum() == 0:
-            return
-        
-        batch_success = (self.progression[mask, :, 0].float().mean(dim=0))
+        batch_success = (self.progression[:, :, 0].float().mean(dim=0))
 
         # ema on the success rate to filter noise
         alpha = self.cfg.success_rate_alpha
@@ -671,27 +666,13 @@ class FrankaCabinetEnv(DirectRLEnv):
 
             if picked.any():
                 # sample subtasks
-                # subtasks = torch.multinomial(
-                #     self.distribution,
-                #     int(picked.sum().item()), # change value to 0 for reset always to subtask 1, value to 1 for reset always to subtask 2, etc
-                #     replacement=True,
-                # )
-
-                subtasks = torch.full(
-                    (int(picked.sum().item()),),
-                    2,
-                    device=self.device,
-                    dtype=torch.long,
+                subtasks = torch.multinomial(
+                    self.distribution,
+                    int(picked.sum().item()), # change value to 0 for reset always to subtask 1, value to 1 for reset always to subtask 2, etc
+                    replacement=True,
                 )
 
                 self.curriculum_subtask[env_ids[picked]] = subtasks
-                
-                # subtasks = torch.full(
-                #     (int(picked.sum().item()),),
-                #     2,
-                #     device=self.device,
-                #     dtype=torch.long,
-                # )
 
                 # sample stored worlds
                 world_ids = torch.randint(
