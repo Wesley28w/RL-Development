@@ -385,7 +385,13 @@ class FactoryEnv(DirectRLEnv):
 
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
-            L["dones/success_rate"] = self.overall_success.mean().item()
+            # exclude environments currently replaying a reset-pose-curriculum state: they were teleported
+            # into an already-partially-completed task, so counting them would inflate the reported success
+            # rate. Fall back to the unfiltered mean on the step every env happens to be a curriculum replay,
+            # so the key is never dropped.
+            natural_mask = ~self.is_curriculum_episode
+            success_for_metric = self.overall_success[natural_mask] if natural_mask.any() else self.overall_success
+            L["dones/success_rate"] = success_for_metric.mean().item()
         return time_out, time_out
 
     def _get_curr_successes(self, success_threshold, check_rot=False):
