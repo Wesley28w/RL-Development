@@ -487,7 +487,12 @@ class FrankaCabinetEnv(DirectRLEnv):
 
     def _update_distribution(self):
         # mask to remove curriculum episodes from compute
-        batch_success = (self.progression[:, :, 0].float().mean(dim=0))
+        mask = ~self.is_curriculum_episode
+        # edge case where every env is curriculum
+        if mask.sum() == 0:
+            return
+        
+        batch_success = (self.progression[mask, :, 0].float().mean(dim=0))
 
         # ema on the success rate to filter noise
         alpha = self.cfg.success_rate_alpha
