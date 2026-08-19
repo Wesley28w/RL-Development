@@ -460,7 +460,7 @@ class FactoryEnv(DirectRLEnv):
         aligned = (xy_dist < 0.001) & is_rotated # make slightly less than 0.0025 for bigger subtask 1 to subtask 2 gap
         # engaged but not rotated
         engaged = self._get_curr_successes(self.cfg_task.engage_threshold, check_rot=False) # 0.5
-        success = self._get_curr_successes(self.cfg_task.success_threshold + 0.05, check_rot=True) # 0.375 is success so we'll use 0.425
+        success = self._get_curr_successes(self.cfg_task.success_threshold + 0.0, check_rot=True) # 0.375 is success so we'll use 0.425
 
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
