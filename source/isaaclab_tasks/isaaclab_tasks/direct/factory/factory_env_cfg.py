@@ -88,7 +88,7 @@ class FactoryEnvCfg(DirectRLEnvCfg):
         "fixed_quat",
     ]
 
-    reset_state_curriculum_enabled = True
+    reset_state_curriculum_enabled = False
 
     task_name: str = "peg_insert"  # peg_insert, gear_mesh, nut_thread
     task: FactoryTask = FactoryTask()
