@@ -75,6 +75,8 @@ class ObjectUniformPoseCommand(CommandTerm):
         # -- metrics
         self.metrics["position_error"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["orientation_error"] = torch.zeros(self.num_envs, device=self.device)
+        # fraction of envs meeting the success criteria at the time of logging (episode end): a proxy for success rate
+        self.metrics["success"] = torch.zeros(self.num_envs, device=self.device)
 
         self.success_visualizer = VisualizationMarkers(self.cfg.success_visualizer_cfg)
         self.success_visualizer.set_visibility(True)
@@ -122,6 +124,7 @@ class ObjectUniformPoseCommand(CommandTerm):
         success_id = self.metrics["position_error"] < 0.05
         if not self.cfg.position_only:
             success_id &= self.metrics["orientation_error"] < 0.5
+        self.metrics["success"] = success_id.float()
         self.success_visualizer.visualize(self.success_vis_asset.data.root_pos_w, marker_indices=success_id.int())
 
     def _resample_command(self, env_ids: Sequence[int]):
