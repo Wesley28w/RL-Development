@@ -14,6 +14,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.actuators.actuator_cfg import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -203,6 +204,16 @@ class EventCfg:
         },
     )
 
+    # Reset-pose curriculum: for a sampled fraction of resets, overwrites the default reset above with a
+    # replayed subtask state (see mdp/events.py). Must be registered *last* in this class so its
+    # writes are the ones that stick. Gated by `reset_state_curriculum_enabled` (True by default below);
+    # setting that to False makes this a complete no-op -- it doesn't even draw from the random generator.
+    sample_curriculum_reset_state = EventTerm(
+        func=mdp.sample_curriculum_reset_state,
+        mode="reset",
+        params={"tracker_term_name": "subtask_progression_tracker"},
+    )
+
 
 @configclass
 class RewardsCfg:
@@ -241,12 +252,47 @@ class RewardsCfg:
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-1e-2)
     joint_vel = RewTerm(func=mdp.joint_vel_l2, weight=-0.0001)
 
+    # Reset-pose curriculum bookkeeping (see mdp/events.py). Always contributes exactly 0 to the reward,
+    # enabled or not -- registered here (rather than as an "interval" event) so a disabled run performs zero
+    # extra RNG draws relative to the true baseline. Gated by `reset_state_curriculum_enabled`; a complete
+    # no-op (no scene reads, no random draws) when that is False.
+    subtask_progression_tracker = RewTerm(
+        func=mdp.subtask_progression_tracker,
+        weight=1.0,
+        params={
+            "proximity_threshold": 0.20,
+            "touch_distance_threshold": 0.03,
+            "slightly_open_fraction": 0.5,
+            "almost_open_fraction": 0.90,
+        },
+    )
+
 
 @configclass
 class TerminationsCfg:
     """Termination terms for the MDP."""
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
+
+
+@configclass
+class CurriculumCfg:
+    """Curriculum terms for the MDP."""
+
+    # read-only: logs the raw (unsmoothed) drawer-opening success rate to TensorBoard, computed only from
+    # natural (non-curriculum) episodes to avoid the replayed episodes inflating the number. See
+    # mdp/curriculums.py's cabinet_success_rate docstring. Logged under "Curriculum/cabinet_success_rate".
+    # Read-only: it does not modify any environment parameter, reward, observation, or termination, so it has
+    # no effect on training.
+    cabinet_success_rate = CurrTerm(func=mdp.cabinet_success_rate, params={"success_fraction": 0.90})
+
+    # surfaces the reset-pose curriculum's bookkeeping (see mdp/events.py) to TensorBoard under
+    # "Curriculum/reset_pose_curriculum_metrics/...". Logging-only: it does not modify any environment
+    # parameter, reward, observation, or termination, so it has no effect on training. Logs nothing (empty
+    # dict) while `reset_state_curriculum_enabled` is False.
+    reset_pose_curriculum_metrics = CurrTerm(
+        func=mdp.reset_pose_curriculum_metrics, params={"tracker_term_name": "subtask_progression_tracker"}
+    )
 
 
 ##
@@ -267,6 +313,16 @@ class CabinetEnvCfg(ManagerBasedRLEnvCfg):
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventCfg = EventCfg()
+    curriculum: CurriculumCfg | None = CurriculumCfg()
+
+    # reset state curriculum (see mdp/events.py)
+    reset_state_curriculum_enabled = True  # master switch; everything below is a full no-op while this is False
+    success_buffer_size = 64
+    prob_exp = 2  # how much we sharpen the probability distribution (1 = no sharpening)
+    sampling_ratio = 0.3  # what fraction of resets go to the sampled (curriculum) distribution
+    curriculum_dr = 0.02  # how much domain randomization to apply to replayed robot joints
+    success_rate_alpha = 0.05  # momentum control of success rate movement (pre-calculations)
+    greedy_margin = 0.10  # controls the margin between top and second distribution value that enables softmax
 
     def __post_init__(self):
         """Post initialization."""
