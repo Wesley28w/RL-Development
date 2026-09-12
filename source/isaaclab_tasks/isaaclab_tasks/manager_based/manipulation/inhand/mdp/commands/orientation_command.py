@@ -73,6 +73,8 @@ class InHandReOrientationCommand(CommandTerm):
         self.metrics["orientation_error"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["position_error"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["consecutive_success"] = torch.zeros(self.num_envs, device=self.device)
+        # fraction of envs that achieved at least one success this episode, logged (as a mean) at episode reset
+        self.metrics["success_rate"] = torch.zeros(self.num_envs, device=self.device)
 
     def __str__(self) -> str:
         msg = "InHandManipulationCommandGenerator:\n"
@@ -103,6 +105,8 @@ class InHandReOrientationCommand(CommandTerm):
         # -- compute the number of consecutive successes
         successes = self.metrics["orientation_error"] < self.cfg.orientation_success_threshold
         self.metrics["consecutive_success"] += successes.float()
+        # -- track whether the episode has had at least one success so far
+        self.metrics["success_rate"] = torch.maximum(self.metrics["success_rate"], successes.float())
 
     def _resample_command(self, env_ids: Sequence[int]):
         # sample new orientation targets
