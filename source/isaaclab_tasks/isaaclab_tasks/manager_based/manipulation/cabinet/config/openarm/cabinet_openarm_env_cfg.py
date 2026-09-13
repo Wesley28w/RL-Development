@@ -316,7 +316,7 @@ class CabinetEnvCfg(ManagerBasedRLEnvCfg):
     curriculum: CurriculumCfg | None = CurriculumCfg()
 
     # reset state curriculum (see mdp/events.py)
-    reset_state_curriculum_enabled = True  # master switch; everything below is a full no-op while this is False
+    reset_state_curriculum_enabled = False  # master switch; everything below is a full no-op while this is False
     success_buffer_size = 64
     prob_exp = 2  # how much we sharpen the probability distribution (1 = no sharpening)
     sampling_ratio = 0.3  # what fraction of resets go to the sampled (curriculum) distribution
