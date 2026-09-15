@@ -27,10 +27,12 @@ class cabinet_success_rate(ManagerTermBase):
     call time rather than assumed as a fixed distance in meters -- the cabinet's spawn scale (and therefore
     its true drawer travel) differs between robot configs (e.g. OpenArm's 0.75x-scaled cabinet vs. Franka's
     unscaled one; scaling a USD actor scales its prismatic joint limits along with it), so a hardcoded meter
-    threshold tuned for one would silently be wrong -- possibly unreachable -- for the other. Since the only
-    termination is time-out, this fires "success" only for episodes where the drawer was actually opened --
-    an agent that never approaches the handle stays at drawer position 0 and is correctly scored as a
-    failure.
+    threshold tuned for one would silently be wrong -- possibly unreachable -- for the other. Pass
+    ``success_threshold`` to use a fixed absolute value instead (e.g. to reproduce the direct-workflow
+    Franka Cabinet environment's original 0.38 m success bar exactly, since its cabinet is unscaled). Since
+    the only termination is time-out, this fires "success" only for episodes where the drawer was actually
+    opened -- an agent that never approaches the handle stays at drawer position 0 and is correctly scored
+    as a failure.
 
     Environments currently replaying a reset-pose-curriculum state (see ``mdp/events.py``) are excluded from
     this metric: those episodes were teleported into an already-partially-opened state, so crediting them as
@@ -56,6 +58,7 @@ class cabinet_success_rate(ManagerTermBase):
         env: ManagerBasedRLEnv,
         env_ids: Sequence[int],
         success_fraction: float = 0.90,
+        success_threshold: float | None = None,
         tracker_term_name: str = "subtask_progression_tracker",
         cabinet_cfg: SceneEntityCfg = SceneEntityCfg("cabinet"),
         drawer_joint_name: str = "drawer_bottom_joint",
@@ -77,8 +80,11 @@ class cabinet_success_rate(ManagerTermBase):
         cabinet: Articulation = env.scene[cabinet_cfg.name]
         drawer_joint_id, _ = cabinet.find_joints([drawer_joint_name])
         drawer_pos = cabinet.data.joint_pos[natural_ids, drawer_joint_id[0]]
-        drawer_limits = cabinet.data.soft_joint_pos_limits[natural_ids, drawer_joint_id[0], :]
-        threshold = drawer_limits[:, 0] + success_fraction * (drawer_limits[:, 1] - drawer_limits[:, 0])
+        if success_threshold is not None:
+            threshold = success_threshold
+        else:
+            drawer_limits = cabinet.data.soft_joint_pos_limits[natural_ids, drawer_joint_id[0], :]
+            threshold = drawer_limits[:, 0] + success_fraction * (drawer_limits[:, 1] - drawer_limits[:, 0])
         self._last_value = (drawer_pos > threshold).float().mean()
         return self._last_value
 

@@ -76,22 +76,27 @@ class subtask_progression_tracker(ManagerTermBase):
       handle, right finger below -- the same condition ``align_grasp_around_handle`` rewards). Distance alone
       would be indistinguishable from an overshoot past the handle without a grasp-capable orientation.
     * Subtask 3 (drawer slightly open): drawer joint position above ``slightly_open_fraction`` (default 0.5)
-      of the drawer joint's own travel range.
+      of the drawer joint's own travel range, unless ``slightly_open_threshold`` is set (see below).
     * Subtask 4 (drawer almost fully open): drawer joint position above ``almost_open_fraction`` (default
-      0.90) of the drawer joint's own travel range -- kept just short of full travel, mirroring the direct
-      Franka Cabinet environment's own final subtask threshold (0.38 out of a ~0.39-0.40 max, i.e. ~96%).
+      0.90) of the drawer joint's own travel range, unless ``almost_open_threshold`` is set (see below) --
+      kept just short of full travel, mirroring the direct Franka Cabinet environment's own final subtask
+      threshold (0.38 out of a ~0.39-0.40 max, i.e. ~96%).
 
-    Subtasks 3 and 4 are expressed as **fractions of the drawer joint's own runtime travel range**
-    (``cabinet.data.soft_joint_pos_limits``), not fixed distances in meters. The direct Franka Cabinet
-    environment's original thresholds (0.20 m / 0.38 m) assume an unscaled cabinet; the OpenArm variant of
-    this scene spawns the cabinet at ``scale=(0.75, 0.75, 0.75)`` (see ``config/openarm/cabinet_openarm_env_cfg.py``),
-    and scaling a USD actor scales its prismatic joint limits along with it (this is documented PhysX
-    behavior -- see e.g. Isaac Gym's physics docs: "Scaling an actor will change its collision geometry, mass
-    properties, joint positions, and prismatic joint limits"). A fixed 0.35 m threshold would sit close to or
-    past the *scaled* drawer's true max travel (~0.75 x 0.39-0.40 =~ 0.29-0.30 m), making subtask 4
-    unreachable. Reading the joint's own limits at runtime instead is correct regardless of the exact scale
-    factor or how precisely it propagates, and works unmodified for both the Franka (unscaled) and OpenArm
-    (0.75x) cabinet variants.
+    Subtasks 3 and 4 default to **fractions of the drawer joint's own runtime travel range**
+    (``cabinet.data.soft_joint_pos_limits``) rather than fixed distances in meters, because scaling a USD
+    actor scales its prismatic joint limits along with it (documented PhysX behavior -- see e.g. Isaac
+    Gym's physics docs: "Scaling an actor will change its collision geometry, mass properties, joint
+    positions, and prismatic joint limits"). The OpenArm variant of this scene spawns the cabinet at
+    ``scale=(0.75, 0.75, 0.75)`` (see ``config/openarm/cabinet_openarm_env_cfg.py``), so a fixed 0.35 m
+    threshold would sit at or past its *scaled* drawer's true max travel (~0.75 x 0.39-0.40 =~ 0.29-0.30 m),
+    making subtask 4 unreachable there. For an *unscaled* cabinet (Franka's), the original direct-workflow
+    environment's literal absolute thresholds (0.20 m / 0.38 m) remain valid and are what that port should
+    reproduce exactly; pass ``slightly_open_threshold``/``almost_open_threshold`` to use those fixed values
+    directly instead of a fraction of the runtime range.
+
+    Subtask 2 additionally requires the correct finger-straddle pose by default
+    (``require_graspable_pose=True``); set it to ``False`` to reproduce the direct-workflow environment's
+    original subtask 2, which is a pure distance check with no grasp-pose condition.
     """
 
     def __init__(self, cfg, env: ManagerBasedRLEnv):
@@ -132,6 +137,9 @@ class subtask_progression_tracker(ManagerTermBase):
         touch_distance_threshold: float = 0.03,
         slightly_open_fraction: float = 0.5,
         almost_open_fraction: float = 0.90,
+        slightly_open_threshold: float | None = None,
+        almost_open_threshold: float | None = None,
+        require_graspable_pose: bool = True,
         update_distribution_prob: float = 0.10,
         robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
         cabinet_cfg: SceneEntityCfg = SceneEntityCfg("cabinet"),
@@ -158,6 +166,9 @@ class subtask_progression_tracker(ManagerTermBase):
             touch_distance_threshold,
             slightly_open_fraction,
             almost_open_fraction,
+            slightly_open_threshold,
+            almost_open_threshold,
+            require_graspable_pose,
             cabinet_cfg,
             drawer_joint_name,
             ee_frame_cfg,
@@ -202,6 +213,9 @@ class subtask_progression_tracker(ManagerTermBase):
         touch_distance_threshold: float,
         slightly_open_fraction: float,
         almost_open_fraction: float,
+        slightly_open_threshold: float | None,
+        almost_open_threshold: float | None,
+        require_graspable_pose: bool,
         cabinet_cfg: SceneEntityCfg,
         drawer_joint_name: str,
         ee_frame_cfg: SceneEntityCfg,
@@ -220,16 +234,24 @@ class subtask_progression_tracker(ManagerTermBase):
         cabinet: Articulation = env.scene[cabinet_cfg.name]
         drawer_joint_id, _ = cabinet.find_joints([drawer_joint_name])
         drawer_pos = cabinet.data.joint_pos[env_ids][:, drawer_joint_id[0]]
-        # thresholds as fractions of the drawer's own runtime travel range -- see class docstring for why
-        # this must not be a fixed distance in meters (the cabinet's spawn scale differs per robot config).
-        drawer_limits = cabinet.data.soft_joint_pos_limits[env_ids][:, drawer_joint_id[0], :]
-        drawer_lower, drawer_upper = drawer_limits[:, 0], drawer_limits[:, 1]
-        drawer_range = drawer_upper - drawer_lower
-        slightly_open_value = drawer_lower + slightly_open_fraction * drawer_range
-        almost_open_value = drawer_lower + almost_open_fraction * drawer_range
+        # thresholds default to fractions of the drawer's own runtime travel range (see class docstring for
+        # why this must not always be a fixed distance in meters -- the cabinet's spawn scale differs per
+        # robot config), but an explicit absolute threshold takes precedence when given.
+        if slightly_open_threshold is None or almost_open_threshold is None:
+            drawer_limits = cabinet.data.soft_joint_pos_limits[env_ids][:, drawer_joint_id[0], :]
+            drawer_lower, drawer_upper = drawer_limits[:, 0], drawer_limits[:, 1]
+            drawer_range = drawer_upper - drawer_lower
+        slightly_open_value = (
+            slightly_open_threshold if slightly_open_threshold is not None else drawer_lower + slightly_open_fraction * drawer_range
+        )
+        almost_open_value = (
+            almost_open_threshold if almost_open_threshold is not None else drawer_lower + almost_open_fraction * drawer_range
+        )
 
         sub_task_1 = distance < proximity_threshold
-        sub_task_2 = (distance < touch_distance_threshold) & is_graspable
+        sub_task_2 = distance < touch_distance_threshold
+        if require_graspable_pose:
+            sub_task_2 = sub_task_2 & is_graspable
         sub_task_3 = drawer_pos > slightly_open_value
         sub_task_4 = drawer_pos > almost_open_value
 
