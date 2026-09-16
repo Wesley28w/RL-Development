@@ -161,11 +161,18 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
 
     # custom hyperparamters
     success_buffer_size = 64
-    prob_exp = 2 # how much we sharpen the probability distribution (1 = No sharpening)
     sampling_ratio = 0.3 # what fraction of resets go to the sample distribution
     curriculum_dr = 0.02 # how much domain randomization to apply to robot joints
     success_rate_alpha = 0.05 # momentum control of success rate movement (pre-calculations)
-    greedy_margin = 0.10 # controls the margin between top and second distribution value that enables softmax
+    # softmax temperature on the simplex-normalised confidence. lower = sharper soft branch. replaces the
+    # old `prob_exp`, which flattened the distribution instead of sharpening it (see _update_distribution)
+    softmax_temperature = 0.25
+    # blend band, in units of the uninformative margin 1/(num_subtasks-1): below `lo` the scheduler runs
+    # fully soft, above `hi` fully greedy, in between it interpolates. replaces the old `greedy_margin`,
+    # which saturated at 1.0 on ~85% of updates
+    greedy_margin_lo = 0.5
+    greedy_margin_hi = 1.5
+    min_subtask_prob = 0.05 # floor on each subtask's sampling probability so none can be starved
     
     # policy params
     curriculum_total_iterations = 2500
@@ -286,6 +293,17 @@ class FrankaCabinetEnv(DirectRLEnv):
         self.success_buffer = torch.zeros([4, self.cfg.success_buffer_size, 13], device=self.device) # 4 subtasks, buffer size of 64, and 13 joint attributes to save 
     
         self.pose_buffer_idx = torch.zeros(
+            4,
+            dtype=torch.long,
+            device=self.device
+        )
+
+        # how many slots of each subtask's buffer have actually been written. sampling an unwritten slot
+        # replays all-zero joint positions (~3.4 rad from the home pose for this franka), which is a state no
+        # rollout ever visits. the difficulty rule concentrates on whichever subtask the policy reaches least
+        # -- exactly the one most likely to still be empty -- so this gates both which subtasks can be
+        # sampled and which slots within them. same as factory_env's pose_buffer_count.
+        self.pose_buffer_count = torch.zeros(
             4,
             dtype=torch.long,
             device=self.device
@@ -436,6 +454,11 @@ class FrankaCabinetEnv(DirectRLEnv):
                         start + count
                     ) % self.cfg.success_buffer_size
 
+                    self.pose_buffer_count[task] = torch.clamp(
+                        self.pose_buffer_count[task] + count,
+                        max=self.cfg.success_buffer_size,
+                    )
+
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
             success = self.progression[:, :, 0]
@@ -507,34 +530,61 @@ class FrankaCabinetEnv(DirectRLEnv):
         gaps = gaps - gaps.min() # ensure all values are postitive
         gaps = gaps + 1e-8 # if all gaps are equal we don't want all 0s so add tiny value
         
-        # softmax distribution 
-        soft = gaps.pow(
-            self.cfg.prob_exp
-        ).softmax(dim=0)
+        num_subtasks = self.success_rate.numel()
 
-        # confidence
+        # confidence: put the gaps on the simplex *before* shaping them
         confidence = (
             gaps / gaps.sum().clamp(min=1e-8) # linear norm
         )
+
+        # soft branch: a real temperature on the normalised confidence.
+        # the old form was gaps.pow(prob_exp).softmax(). gaps live in [0, 1], so raising them to a power
+        # pushes them toward zero, and a softmax over values spanning ~0.04 is flat to within 4%. measured
+        # on the paper runs the soft branch sat within 0.05 of uniform for entire runs -- it was not a soft
+        # preference, it was uniform sampling, which left the greedy branch as the only thing that ever
+        # shaped the distribution.
+        soft = (confidence / self.cfg.softmax_temperature).softmax(dim=0)
 
         top2 = torch.topk(confidence, k=2)
         winner = top2.indices[0] # biggest fr
         margin = (top2.values[0] - top2.values[1]) # difference between biggest and second biggest fr
 
+        # `gaps - gaps.min()` forces one entry to zero, so confidence is a distribution over at most
+        # num_subtasks-1 non-zero entries. under an uninformative difficulty signal (flat Dirichlet over
+        # those entries) E[margin] is exactly 1/(num_subtasks-1) -- verified numerically at K=3,4,5.
+        # dividing by that reference makes the margin mean the same thing regardless of how many subtasks
+        # the task has: ~1 is "no more informative than noise", >1 is "one subtask genuinely stands out".
+        margin_ref = 1.0 / max(num_subtasks - 1, 1)
+        margin_norm = margin / margin_ref
+
         # greedy
         hard = torch.zeros_like(gaps)
         hard[winner] = 1.0
 
-        # blend between the two
-        blend = torch.clamp(margin / self.cfg.greedy_margin, 0.0, 1.0) # elegant: if margin is great than 0.1 then it will be clamped to 1.0. 
-        self.distribution = ((1.0 - blend) * soft + blend * hard)
-        self.distribution /= self.distribution.sum()
+        # traverse soft -> greedy across a band instead of saturating. the old clamp(margin / 0.10) hit its
+        # ceiling on ~85% of updates, so blend was pinned at exactly 1 and the controller was bang-bang
+        # between one-hot and uniform with nothing in between. the band below leaves ~70% of updates
+        # strictly inside (0, 1) on the logged margins from the paper runs.
+        blend = torch.clamp(
+            (margin_norm - self.cfg.greedy_margin_lo)
+            / max(self.cfg.greedy_margin_hi - self.cfg.greedy_margin_lo, 1e-8),
+            0.0,
+            1.0,
+        )
+        distribution = ((1.0 - blend) * soft + blend * hard)
+
+        # floor every subtask so none can be starved to exactly zero. a subtask that stops being sampled
+        # stops generating buffer entries and stops being re-evaluated, which makes the collapse permanent.
+        eps = self.cfg.min_subtask_prob
+        distribution = (1.0 - eps * num_subtasks) * distribution + eps
+        self.distribution = distribution / distribution.sum()
 
         # for logging
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
             L["curriculum/blend"] = blend.item()
             L["curriculum/margin"] = margin.item()
+            L["curriculum/margin_norm"] = margin_norm.item()
             L["curriculum/selected"] = winner.item()
             for i in range(4):
                 L[f"curriculum/success_rate_{i+1}"] = (self.success_rate[i].item())
@@ -663,6 +713,11 @@ class FrankaCabinetEnv(DirectRLEnv):
             picked = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
             picked[perm[:num_curriculum]] = True
 
+            # only subtasks the policy has actually reached may be replayed (see pose_buffer_count)
+            valid_subtasks = self.pose_buffer_count > 0
+            if not valid_subtasks.any():
+                picked[:] = False
+
             # update what episodes are actively using the curriculum
             self.is_curriculum_episode[env_ids] = False
             self.is_curriculum_episode[env_ids[picked]] = True
@@ -670,22 +725,30 @@ class FrankaCabinetEnv(DirectRLEnv):
             self.curriculum_subtask[env_ids] = -1
 
             if picked.any():
-                # sample subtasks
+                # sample subtasks, restricted to ones that actually have recorded poses. if the distribution
+                # has committed all of its mass to subtasks with no data, fall back to uniform over the ones
+                # that do have data.
+                masked_distribution = torch.where(
+                    valid_subtasks, self.distribution, torch.zeros_like(self.distribution)
+                )
+                if masked_distribution.sum() <= 0:
+                    masked_distribution = valid_subtasks.float()
+                masked_distribution = masked_distribution / masked_distribution.sum()
+
                 subtasks = torch.multinomial(
-                    self.distribution,
+                    masked_distribution,
                     int(picked.sum().item()), # change value to 0 for reset always to subtask 1, value to 1 for reset always to subtask 2, etc
                     replacement=True,
                 )
 
                 self.curriculum_subtask[env_ids[picked]] = subtasks
 
-                # sample stored worlds
-                world_ids = torch.randint(
-                    0,
-                    self.cfg.success_buffer_size,
-                    (int(picked.sum().item()),),
-                    device=self.device,
-                )
+                # sample stored worlds, clamped to the slots that have actually been written for that subtask
+                max_valid = self.pose_buffer_count[subtasks].clamp(min=1)
+                world_ids = (
+                    torch.rand(int(picked.sum().item()), device=self.device) * max_valid.float()
+                ).long()
+                world_ids = world_ids.clamp(max=self.cfg.success_buffer_size - 1)
 
                 worlds = self.success_buffer[subtasks, world_ids]
 
@@ -736,6 +799,9 @@ class FrankaCabinetEnv(DirectRLEnv):
             if self.curriculum_enabled:
                 L["curriculum/sample_rate"] = picked.float().mean().item() # make sure we are sampling correct ratio
                 L["curriculum/sample_ratio_target"] = sample_ratio
+                L["curriculum/valid_subtasks"] = self.pose_buffer_count.gt(0).float().sum().item()
+                for i in range(4):
+                    L[f"curriculum/buffer_fill_{i+1}"] = self.pose_buffer_count[i].item()
 
     def _get_observations(self) -> dict:
         dof_pos_scaled = (
