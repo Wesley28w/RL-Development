@@ -707,11 +707,19 @@ class FrankaCabinetEnv(DirectRLEnv):
         # robot reset
         robot_joint_pos = torch.clamp(robot_joint_pos, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
         joint_vel = torch.zeros_like(robot_joint_pos)
+        # re-anchor the action integrator on the pose we are resetting to. actions are deltas accumulated onto
+        # robot_dof_targets (see _pre_physics_step) and _apply_action writes that whole buffer every step for
+        # all envs, so without this the target below is immediately overwritten by the *previous* episode's
+        # final commanded target -- hidden state leaking across the episode boundary. factory_env does the same.
+        self.robot_dof_targets[env_ids] = robot_joint_pos
         self._robot.set_joint_position_target(robot_joint_pos, env_ids=env_ids)
         self._robot.write_joint_state_to_sim(robot_joint_pos, joint_vel, env_ids=env_ids)
 
-        # cabinet reset
-        self._cabinet.write_joint_state_to_sim(cabinet, cabinet, env_ids=env_ids)
+        # cabinet reset. `cabinet` holds joint *positions* (zeros normally, a replayed drawer state when the
+        # curriculum picked this env), so velocity needs its own zero tensor -- passing `cabinet` twice would
+        # launch a replayed drawer outward at drawer_pos m/s.
+        cabinet_joint_vel = torch.zeros_like(cabinet)
+        self._cabinet.write_joint_state_to_sim(cabinet, cabinet_joint_vel, env_ids=env_ids)
 
         # refresh observations
         self._compute_intermediate_values(env_ids)
