@@ -185,8 +185,14 @@ class subtask_progression_tracker(ManagerTermBase):
         new_completion = completions & (~previously_completed)
         self.progression = previously_completed | completions
 
-        # add newly-completed worlds to the per-subtask ring buffer
-        completed_rows, completed_tasks = torch.where(new_completion)
+        # add newly-completed worlds to the per-subtask ring buffer -- only from NATURAL episodes.
+        # self.progression is cleared for every env at reset, so a curriculum env satisfies the subtask it
+        # was teleported into on the first evaluation after the teleport; without this mask it re-deposits
+        # its own start state (plus the curriculum_dr noise) one step after drawing it, and the buffer turns
+        # into a self-replicating population of its own output rather than a record of what the policy did.
+        # A rung-4 teleport also satisfies rung 3 immediately, so one teleport would seed several buffers.
+        buffer_completion = new_completion & (~self.is_curriculum_episode).unsqueeze(1)
+        completed_rows, completed_tasks = torch.where(buffer_completion)
         if completed_rows.numel() > 0:
             completed_worlds = world[completed_rows]
             for task in range(NUM_SUBTASKS):
