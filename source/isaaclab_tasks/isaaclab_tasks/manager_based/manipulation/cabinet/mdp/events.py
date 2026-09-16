@@ -114,6 +114,11 @@ class subtask_progression_tracker(ManagerTermBase):
             NUM_SUBTASKS, env.cfg.success_buffer_size, self.world_dim, device=env.device
         )
         self.pose_buffer_idx = torch.zeros(NUM_SUBTASKS, dtype=torch.long, device=env.device)
+        # how many slots of each subtask's ring buffer have actually been written. Sampling a slot that has
+        # never been written replays all-zero joint positions, not a state the policy reached, so this gates
+        # both which subtasks may be sampled at all and which slots within them -- see
+        # sample_curriculum_reset_state. Mirrors the Factory environment's pose_buffer_count.
+        self.pose_buffer_count = torch.zeros(NUM_SUBTASKS, dtype=torch.long, device=env.device)
         self.success_rate = torch.zeros(NUM_SUBTASKS, device=env.device)
         self.distribution = torch.softmax(torch.ones(NUM_SUBTASKS, device=env.device), dim=0)
 
@@ -194,6 +199,9 @@ class subtask_progression_tracker(ManagerTermBase):
                 indices = (torch.arange(count, device=env.device) + start) % env.cfg.success_buffer_size
                 self.success_buffer[task, indices] = worlds
                 self.pose_buffer_idx[task] = (start + count) % env.cfg.success_buffer_size
+                self.pose_buffer_count[task] = torch.clamp(
+                    self.pose_buffer_count[task] + count, max=env.cfg.success_buffer_size
+                )
 
         if torch.rand((), device=env.device) < update_distribution_prob:
             self._update_distribution(env)
@@ -283,22 +291,47 @@ class subtask_progression_tracker(ManagerTermBase):
         gaps = gaps - gaps.min()
         gaps = gaps + 1e-8
 
-        soft = gaps.pow(env.cfg.prob_exp).softmax(dim=0)
-
+        # put the gaps on the simplex first, then shape them with a real temperature. the old form was
+        # gaps.pow(prob_exp).softmax(): gaps live in [0, 1], so raising them to a power pushes them toward
+        # zero, and a softmax over values spanning ~0.04 is flat to within 4%. measured on the paper runs
+        # the soft branch stayed within 0.05 of uniform for entire runs -- it was uniform sampling, not a
+        # soft preference, which left the greedy branch as the only thing shaping the distribution.
         confidence = gaps / gaps.sum().clamp(min=1e-8)
+        soft = (confidence / env.cfg.softmax_temperature).softmax(dim=0)
+
         top2 = torch.topk(confidence, k=2)
         winner = top2.indices[0]
         margin = top2.values[0] - top2.values[1]
 
+        # `gaps - gaps.min()` forces one entry to zero, so confidence spreads over at most NUM_SUBTASKS-1
+        # non-zero entries. under an uninformative difficulty signal E[margin] is exactly 1/(NUM_SUBTASKS-1),
+        # so dividing by that makes the margin comparable across tasks with different subtask counts: ~1
+        # means "no more informative than noise", >1 means one subtask genuinely stands out.
+        margin_ref = 1.0 / max(NUM_SUBTASKS - 1, 1)
+        margin_norm = margin / margin_ref
+
         hard = torch.zeros_like(gaps)
         hard[winner] = 1.0
 
-        blend = torch.clamp(margin / env.cfg.greedy_margin, 0.0, 1.0)
-        self.distribution = (1.0 - blend) * soft + blend * hard
-        self.distribution = self.distribution / self.distribution.sum()
+        # traverse soft -> greedy across a band instead of saturating. the old clamp(margin / 0.10) hit its
+        # ceiling on ~85% of updates, making the controller bang-bang between one-hot and uniform.
+        blend = torch.clamp(
+            (margin_norm - env.cfg.greedy_margin_lo)
+            / max(env.cfg.greedy_margin_hi - env.cfg.greedy_margin_lo, 1e-8),
+            0.0,
+            1.0,
+        )
+        distribution = (1.0 - blend) * soft + blend * hard
+
+        # floor every subtask so none is starved to exactly zero: a subtask that stops being sampled stops
+        # generating buffer entries and stops being re-evaluated, which makes the collapse permanent.
+        eps = env.cfg.min_subtask_prob
+        distribution = (1.0 - eps * NUM_SUBTASKS) * distribution + eps
+        self.distribution = distribution / distribution.sum()
 
         self._log["curriculum/blend"] = blend.item()
         self._log["curriculum/margin"] = margin.item()
+        self._log["curriculum/margin_norm"] = margin_norm.item()
         self._log["curriculum/selected"] = winner.item()
         for i in range(NUM_SUBTASKS):
             self._log[f"curriculum/success_rate_{i + 1}"] = self.success_rate[i].item()
@@ -331,6 +364,21 @@ def sample_curriculum_reset_state(
     env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
     picked = torch.rand(len(env_ids), device=env.device) < env.cfg.sampling_ratio
 
+    # a subtask may only be replayed once the policy has actually reached it at least once; until then its
+    # buffer holds all-zero joint positions, and replaying those teleports the arm to a configuration no
+    # rollout ever visited. The difficulty rule concentrates on whichever subtask the policy reaches *least*,
+    # i.e. exactly the one most likely to have an empty buffer, so without this gate the curriculum spends its
+    # budget on garbage states precisely when it can least afford to.
+    valid_subtasks = tracker.pose_buffer_count > 0
+    if not valid_subtasks.any():
+        # nothing recorded yet anywhere -- leave every environment on its default reset
+        tracker.is_curriculum_episode[env_ids] = False
+        tracker.curriculum_subtask[env_ids] = -1
+        tracker._log["curriculum/sample_rate"] = 0.0
+        tracker._log["curriculum/natural"] = tracker.is_curriculum_episode.float().mean().item()
+        tracker._log["curriculum/valid_subtasks"] = 0.0
+        return
+
     tracker.is_curriculum_episode[env_ids] = False
     tracker.is_curriculum_episode[env_ids[picked]] = True
     tracker.curriculum_subtask[env_ids] = -1
@@ -338,6 +386,7 @@ def sample_curriculum_reset_state(
     if not picked.any():
         tracker._log["curriculum/sample_rate"] = 0.0
         tracker._log["curriculum/natural"] = tracker.is_curriculum_episode.float().mean().item()
+        tracker._log["curriculum/valid_subtasks"] = valid_subtasks.float().sum().item()
         return
 
     robot: Articulation = env.scene[robot_cfg.name]
@@ -345,10 +394,20 @@ def sample_curriculum_reset_state(
     picked_ids = env_ids[picked]
     num_picked = picked_ids.numel()
 
-    subtasks = torch.multinomial(tracker.distribution, num_picked, replacement=True)
+    # restrict the sampling distribution to subtasks that have recorded poses; if the curriculum has
+    # committed all of its mass to subtasks that have none, fall back to uniform over the ones that do
+    masked_distribution = torch.where(valid_subtasks, tracker.distribution, torch.zeros_like(tracker.distribution))
+    if masked_distribution.sum() <= 0:
+        masked_distribution = valid_subtasks.float()
+    masked_distribution = masked_distribution / masked_distribution.sum()
+
+    subtasks = torch.multinomial(masked_distribution, num_picked, replacement=True)
     tracker.curriculum_subtask[picked_ids] = subtasks
 
-    world_ids = torch.randint(0, env.cfg.success_buffer_size, (num_picked,), device=env.device)
+    # draw only from slots that have actually been written for the chosen subtask
+    max_valid = tracker.pose_buffer_count[subtasks].clamp(min=1)
+    world_ids = (torch.rand(num_picked, device=env.device) * max_valid.float()).long()
+    world_ids = world_ids.clamp(max=env.cfg.success_buffer_size - 1)
     worlds = tracker.success_buffer[subtasks, world_ids]
 
     num_robot_joints = robot.num_joints
@@ -374,3 +433,6 @@ def sample_curriculum_reset_state(
     tracker._log["curriculum/reset_variance"] = variance.item()
     tracker._log["curriculum/sample_rate"] = picked.float().mean().item()
     tracker._log["curriculum/natural"] = tracker.is_curriculum_episode.float().mean().item()
+    tracker._log["curriculum/valid_subtasks"] = valid_subtasks.float().sum().item()
+    for i in range(NUM_SUBTASKS):
+        tracker._log[f"curriculum/buffer_fill_{i + 1}"] = tracker.pose_buffer_count[i].item()

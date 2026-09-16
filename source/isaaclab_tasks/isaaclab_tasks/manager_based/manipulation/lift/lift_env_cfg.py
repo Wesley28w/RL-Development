@@ -181,8 +181,12 @@ class RewardsCfg:
         weight=1.0,
         params={
             "reach_threshold": 0.10,
-            "grasp_distance_threshold": 0.02,
-            "gripper_closed_threshold": 0.02,
+            # the grasp band must clear the held object's half-width -- the Franka scene's 0.8-scaled DexCube
+            # leaves the fingers at ~0.0206, so the previous 0.02 cutoff made subtask 2 unreachable. See
+            # mdp/events.py's subtask_progression_tracker docstring.
+            "grasp_distance_threshold": 0.03,
+            "gripper_closed_threshold": 0.035,
+            "gripper_min_opening": 0.005,
             "lift_height_threshold": 0.10,
             "near_goal_threshold": 0.05,
             "command_name": "object_pose",
@@ -259,11 +263,19 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     # kept identical across subtasks rather than retuned per-subtask.
     reset_state_curriculum_enabled = True  # master switch; everything below is a full no-op while this is False
     success_buffer_size = 64
-    prob_exp = 2  # how much we sharpen the probability distribution (1 = no sharpening)
+    # softmax temperature on the simplex-normalised confidence; lower = sharper soft branch.
+    # replaces the old `prob_exp`, which flattened the distribution instead of sharpening it
+    # (see mdp/events.py's _update_distribution).
+    softmax_temperature = 0.25
     sampling_ratio = 0.3  # what fraction of resets go to the sampled (curriculum) distribution
     curriculum_dr = 0.02  # how much domain randomization to apply to replayed robot joints
     success_rate_alpha = 0.05  # momentum control of success rate movement (pre-calculations)
-    greedy_margin = 0.10  # controls the margin between top and second distribution value that enables softmax
+    # blend band, in units of the uninformative margin 1/(NUM_SUBTASKS-1): below `lo` the scheduler
+    # runs fully soft, above `hi` fully greedy, in between it interpolates. replaces the old
+    # `greedy_margin`, which saturated at 1.0 on ~85% of updates.
+    greedy_margin_lo = 0.5
+    greedy_margin_hi = 1.5
+    min_subtask_prob = 0.05  # floor on each subtask's sampling probability so none can be starved
 
     def __post_init__(self):
         """Post initialization."""
