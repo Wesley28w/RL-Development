@@ -501,8 +501,18 @@ class FactoryEnv(DirectRLEnv):
             self.progression[:,:,1:]
         )
         
-        # add successful worlds to buffer (sliding)
-        completed_envs, completed_tasks = torch.where(new_completion)
+        # add successful worlds to buffer (sliding).
+        # ONLY natural episodes may contribute. self.progression is zeroed for every env at reset, so a
+        # curriculum env satisfies the rung it was teleported into on the very first evaluation after the
+        # teleport -- without this mask it re-deposits its own start state one physics step after drawing
+        # it, and the buffer becomes a self-replicating population of its own output rather than a record
+        # of what the policy achieved. The rungs are nested (_get_curr_successes tests
+        # z_disp < height * threshold, and success_threshold 0.04 < engage_threshold 0.9, so success
+        # implies engaged; an inserted peg is also physically centered, so it usually registers aligned
+        # too), which means one rung-3 teleport would otherwise seed two or three buffers with the same
+        # state. Matches the same mask in franka_cabinet_env and the two manager-based ports.
+        buffer_completion = new_completion & (~self.is_curriculum_episode).unsqueeze(1)
+        completed_envs, completed_tasks = torch.where(buffer_completion)
 
         if len(completed_envs) > 0:
             completed_worlds = world[completed_envs]
