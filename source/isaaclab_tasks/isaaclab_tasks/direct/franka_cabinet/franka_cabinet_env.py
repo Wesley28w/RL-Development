@@ -22,7 +22,6 @@ from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.math import sample_uniform
 
-
 @configclass
 class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     # env
@@ -157,6 +156,8 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     action_penalty_scale = 0.05
     finger_reward_scale = 2.0
 
+    # curriculum implentation
+    rcg: RCGCfg = RCGCfg()
 
 class FrankaCabinetEnv(DirectRLEnv):
     # pre-physics step calls
@@ -258,6 +259,33 @@ class FrankaCabinetEnv(DirectRLEnv):
         self.drawer_grasp_rot = torch.zeros((self.num_envs, 4), device=self.device)
         self.drawer_grasp_pos = torch.zeros((self.num_envs, 3), device=self.device)
 
+        self.rcg_pool = {
+            "robot_joint_pos": torch.empty((0, 9), device=self.device),
+            "robot_target_pos": torch.empty((0, 9), device=self.device),
+            "cabinet_joint_pos": torch.empty((0, 1), device=self.device)
+        }
+
+        goal_state = torch.load("successful_state.pt") # need to load successful states from seperate training run
+        self.rcg_good_starts = goal_state
+        self.rcg_old_starts = goal_state
+
+        self.rcg_env_start_id = torch.full(
+            (self.num_envs,),
+            -1,
+            dtype=torch.long,
+            device=self.device
+        )
+
+        self.rcg_start_attempts = torch.zeros(
+            self.rcg_pool_size,
+            device=self.device,
+        )
+
+        self.rcg_start_successes = torch.zeros(
+            self.rcg_pool_size,
+            device=self.device
+        )
+
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
         self._cabinet = Articulation(self.cfg.cabinet)
@@ -323,9 +351,97 @@ class FrankaCabinetEnv(DirectRLEnv):
             self._robot.data.joint_pos,
         )
 
-    def _reset_idx(self, env_ids: torch.Tensor | None):
-        super()._reset_idx(env_ids)
-        # robot state
+    def _record_rcg_episode_results(self, env_ids):
+        valid = self.rcg_env_start_id[env_ids] >= 0
+
+        if not valid.any():
+            return
+
+        finnished_envs = env_ids[valid]
+        start_ids = self.rcg_env_start_id[finnished_envs]
+        successes = self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.39
+        successes_cropped = successes[finnished_envs].float()      
+
+        ones = torch.ones_like(successes)
+        self.rcg_start_attempts.scatter_add_(
+            0,
+            start_ids,
+            ones,
+        )
+
+        self.rcg_start_successes.scatter_add_(
+            0,
+            start_ids,
+            successes,
+        )  
+
+    def _sample_nearby(self):
+        self.rcg_pool = self._brownian_expand(
+            self.rcg_good_starts
+        )
+
+        self.rcg_pool = self._append_old_starts(
+            new_states=self.rcg_pool,
+            old_states=self.rcg_old_starts,
+        )
+
+    def _select_good_starts(self):
+        attempted = self.rcg_start_attempts > 0
+        rates = torch.zeros_like(
+            self.rcg_start_successes
+        )
+
+        rates[attempted] = (
+            self.rcg_start_successes[attempted]
+            / self.rcg_start_attempts[attempted]
+        )
+
+        good = (
+            attempted
+            & (rates >= self.cfg.rcg.r_min)
+            & (rates <= self.cfg.rcg.r_max)
+        )
+
+        good_ids = torch.where(good)[0]
+
+        return self._index_state_pool(
+            self.rcg_pool,
+            good_ids
+        )
+    
+    def _capture_rcg_state(self, env_ids: torch.Tensor | None):
+        robot_joint_pos = self._robot.data.joint_pos[env_ids].clone()
+        robot_joint_target = self._robot.data.joint_pos_target[env_ids].clone()
+
+        cabinet_joint_pos = self._cabinet.data.joint_pos[env_ids].clone()
+
+        # if using positions remove self.scene.env_origins[env_ids]
+
+        return {
+            "robot_joint_pos": robot_joint_pos,
+            "robot_joint_target": robot_joint_target,
+            "cabinet_joint_pos": cabinet_joint_pos
+        }
+
+    def _restore_rcg_state(self, env_ids: torch.Tensor | None, reset_states):
+        if env_ids is None: return
+        robot_joint_pos = reset_states["robot_joint_pos"]
+        robot_joint_target = reset_states["robot_joint_target"]
+        cabinet_joint_pos = reset_states["cabinet_joint_pos"]
+        # if using position, clone() the value
+
+        # if using position add the self.scene.env_origins[env_ids]
+
+        # static vel on reset
+        robot_joint_vel = torch.zeros_like(robot_joint_pos)
+        cabinet_joint_vel = torch.zeros((len(env_ids), self._cabinet.num_joints), device=self.device)
+
+        # write to sim
+        self._robot.set_joint_position_target(robot_joint_target, env_ids=env_ids)
+        self._robot.write_joint_state_to_sim(robot_joint_pos, robot_joint_vel, env_ids=env_ids)
+        self._cabinet.write_joint_state_to_sim(cabinet_joint_pos, cabinet_joint_vel, env_ids=env_ids)
+
+    def _normal_reset(self, env_ids: torch.Tensor | None):
         joint_pos = self._robot.data.default_joint_pos[env_ids] + sample_uniform(
             -0.125,
             0.125,
@@ -341,8 +457,84 @@ class FrankaCabinetEnv(DirectRLEnv):
         zeros = torch.zeros((len(env_ids), self._cabinet.num_joints), device=self.device)
         self._cabinet.write_joint_state_to_sim(zeros, zeros, env_ids=env_ids)
 
+    def _reset_idx(self, env_ids: torch.Tensor | None):
+
+        # record episode results()
+
+        super()._reset_idx(env_ids)
+        if not self.cfg.rcg.enabled:
+            self._normal_reset(env_ids)
+
+        pool_ids = torch.randint(
+            low=0,
+            high=self.rcg_pool_size,
+            size=(len(env_ids),),
+            device=self.device,
+        )
+
+        reset_states = self._index_state_pool(
+            self.rcg_pool,
+            pool_ids,
+        )
+
+        self._restore_rcg_state(env_ids=env_ids, reset_states=reset_states)
+
+        self.rcg_env_start_id[env_ids] = pool_ids
+
         # Need to refresh the intermediate values so that _get_observations() can use the latest values
         self._compute_intermediate_values(env_ids)
+
+    @torch.inference_mode():
+    def advance_rcg_stage(self):
+        # Determine frontier
+        good_starts = self._select_good_starts()
+
+        if self._pool_size(good_starts) == 0:
+            print("[RCG] No good starts yet. Continuing current stage.")
+            return False
+
+        # archive them
+        self.rcg_old_starts = self._concat_state_pools([
+            self.rcg_old_starts,
+            good_starts,
+        ])
+
+        # brownian expansion
+        new_starts = self._brownian_expand(
+            good_starts
+        )
+
+        # replay old good states
+        old_starts = self._sample_state_pool(
+            self.rcg_old_starts,
+            self.cfg.rcg.n_old,
+        )
+
+        # new training distrubtion
+        self.rcg_pool = self._concat_state_pools([
+            new_starts,
+            old_starts,
+        ])
+
+        # reset stats
+        self._reset_rcg_statistics()
+
+        # reset every training env into new distrubiton
+        all_env_ids = torch.arange(
+            self.num_envs,
+            device=self.device,
+            dtype=torch.int32,
+        )
+
+        self._reset_idx(all_env_ids)
+
+        self.scene.write_data_to_sim()
+        self.sim.forward()
+
+        # update since we intemedintly change things
+        self.obs_buf = self._get_observations()
+
+        return True
 
     def _get_observations(self) -> dict:
         dof_pos_scaled = (
@@ -390,6 +582,85 @@ class FrankaCabinetEnv(DirectRLEnv):
             self.drawer_local_grasp_rot[env_ids],
             self.drawer_local_grasp_pos[env_ids],
         )
+
+    # physics only step (used for Brownian Motion Application)
+    def _rcg_physics_step(self, actions):
+        # same action preprocessing as normal RL
+        self._pre_physics_step(actions)
+
+        # advance physics only. NO rewards, dones, resets, or ppo
+        
+        for _ in range(self.cfg.decimation):
+            self._apply_action()
+
+            self.scene.write_data_to_sim()
+            self.sim.step(render=False)
+            self.scene.update(
+                dt=self.physics_dt
+            )
+
+    @torch.inference_mode()
+    def _brownian_expand(self, seeds):
+        candidates = []
+
+        while self._pool_length(candidates) < self.cfg.rcg.candidate_count:
+            seed_ids = torch.randint(
+                0,
+                self._pool_size(seeds),
+                (self.num_envs,),
+                device=self.device,
+            )
+
+            batch = self._index_state_pool(
+                seeds,
+                seed_ids
+            )
+
+            all_env_ids = torch.arange(
+                self.num_envs,
+                device=self.device,
+                dtype=torch.int32,
+            )
+
+            for _ in range(self.cfg.rcg.brownian_horizon):
+
+                action = (
+                    torch.randn(
+                        (self.num_envs, self.num_actions),
+                        device = self.device,
+                    )
+                    * self.cfg.rcg.brownian_action_std
+                )
+
+                actions = torch.clamp(
+                    actions,
+                    -1.0,
+                    1.0
+                )
+
+                self._rcg_physics_step(actions)
+
+                # Every visited state is a candidate
+
+                if self.common_step_counter % 4:
+                    candidates.append(
+                        self._capture_rcg_state(all_env_ids)
+                    )
+
+            candidates = self._concat_state_pools(candidates)
+
+            # uniformly select N_new from all generated states
+            perm = torch.randperm(
+                self._pool_size(candidates),
+                device=self.device
+            )
+
+            ids = perm[:self.cfg.rcg.n_new]
+
+            return self._index_state_pool(
+                candidates,
+                ids,
+            )
 
     def _compute_rewards(
         self,
