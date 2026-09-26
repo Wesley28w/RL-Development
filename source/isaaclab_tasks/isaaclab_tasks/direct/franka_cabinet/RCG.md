@@ -191,20 +191,26 @@ So the pool genuinely regresses away from the goal, and `brownian_state_noise_st
 
 ## Reproducing the benchmark
 
+Commands are written on one line because the shell here is PowerShell, where a trailing `\` is a
+parse error (`Missing expression after unary operator '--'`). PowerShell's continuation character
+is a backtick, and nothing — not even a space — may follow it on the line. Activate the
+environment first, or `isaaclab.bat` resolves to base conda Python and fails with
+`No module named 'isaacsim'`:
+
+```powershell
+conda activate env_isaaclab
+```
+
 ### 1. Baseline PPO (also produces the goal states)
 
-```bash
-isaaclab.bat -p scripts/reinforcement_learning/rsl_rl/train.py \
-    --task Isaac-Franka-Cabinet-Direct-v0 --headless
+```powershell
+isaaclab.bat -p scripts/reinforcement_learning/rsl_rl/train.py --task Isaac-Franka-Cabinet-Direct-v0 --headless
 ```
 
 ### 2. Record `s^g`
 
-```bash
-isaaclab.bat -p scripts/rcg/record_goal_states.py \
-    --task Isaac-Franka-Cabinet-Direct-v0 \
-    --checkpoint logs/rsl_rl/franka_cabinet_direct/<run>/model_1499.pt \
-    --num_states 1000 --headless
+```powershell
+isaaclab.bat -p scripts/rcg/record_goal_states.py --task Isaac-Franka-Cabinet-Direct-v0 --checkpoint logs/rsl_rl/franka_cabinet_direct/<run>/model_1499.pt --num_states 1000 --headless
 ```
 
 Writes `franka_cabinet/data/goal_states_franka_cabinet.pt` and prints the drawer opening and
@@ -219,7 +225,7 @@ backwards from such a state never produces starts with the gripper near the hand
 
 ### 3. Verify capture/restore before trusting anything
 
-```bash
+```powershell
 isaaclab.bat -p scripts/rcg/test_state_roundtrip.py --num_envs 64 --headless
 isaaclab.bat -p scripts/rcg/test_state_roundtrip.py --num_envs 256 --dry_run_expand --headless
 ```
@@ -245,9 +251,8 @@ curriculum logic can compensate for start states the policy can never actually b
 
 ### 4. RCG training
 
-```bash
-isaaclab.bat -p scripts/reinforcement_learning/rsl_rl/train.py \
-    --task Isaac-Franka-Cabinet-RCG-Direct-v0 --headless
+```powershell
+isaaclab.bat -p scripts/reinforcement_learning/rsl_rl/train.py --task Isaac-Franka-Cabinet-RCG-Direct-v0 --headless
 ```
 
 ### 5. Comparable evaluation
@@ -255,11 +260,9 @@ isaaclab.bat -p scripts/reinforcement_learning/rsl_rl/train.py \
 Training-time success rate is **not** comparable across the two arms: RCG trains on curriculum
 starts, the baseline on `rho_0`. Evaluate both from `rho_0`:
 
-```bash
-isaaclab.bat -p scripts/rcg/evaluate.py --task Isaac-Franka-Cabinet-Direct-v0 \
-    --run_dir logs/rsl_rl/franka_cabinet_direct/<run> --episodes 512 --headless
-isaaclab.bat -p scripts/rcg/evaluate.py --task Isaac-Franka-Cabinet-RCG-Direct-v0 \
-    --run_dir logs/rsl_rl/franka_cabinet_rcg/<run> --episodes 512 --headless
+```powershell
+isaaclab.bat -p scripts/rcg/evaluate.py --task Isaac-Franka-Cabinet-Direct-v0 --run_dir logs/rsl_rl/franka_cabinet_direct/<run> --episodes 512 --headless
+isaaclab.bat -p scripts/rcg/evaluate.py --task Isaac-Franka-Cabinet-RCG-Direct-v0 --run_dir logs/rsl_rl/franka_cabinet_rcg/<run> --episodes 512 --headless
 ```
 
 Each writes `rho0_eval.csv` in the run directory. `play.py` also forces `rcg.enabled = False`,

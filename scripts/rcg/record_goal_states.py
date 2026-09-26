@@ -18,12 +18,11 @@ partially trained checkpoint is enough -- only a few hundred success states are 
 
 Usage:
 
-.. code-block:: bash
+.. code-block:: powershell
 
-    isaaclab.bat -p scripts/rcg/record_goal_states.py \
-        --task Isaac-Franka-Cabinet-Direct-v0 \
-        --checkpoint logs/rsl_rl/franka_cabinet_direct/<run>/model_1499.pt \
-        --num_states 1000 --headless
+    # note: ` is PowerShell's line continuation, and nothing may follow it on the line
+    isaaclab.bat -p scripts/rcg/record_goal_states.py --task Isaac-Franka-Cabinet-Direct-v0 `
+        --checkpoint logs/rsl_rl/franka_cabinet_direct/<run>/model_1499.pt --num_states 1000 --headless
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -143,6 +142,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     torch.save(payload, output_path)
 
     print(f"\n[INFO] Recorded {num_recorded} goal state(s) in {steps} steps -> {output_path}")
+    if num_recorded < args_cli.num_states:
+        # the success rate implied by the shortfall is worth knowing before reading any benchmark
+        # number, so report it rather than quietly writing a smaller file than was asked for
+        episodes = steps * args_cli.num_envs / max(1, base_env.max_episode_length)
+        print(
+            f"[WARNING] Asked for {args_cli.num_states} goal states but only reached {num_recorded} before the"
+            f" --max_steps limit of {args_cli.max_steps}. That implies this checkpoint solves roughly"
+            f" {100.0 * num_recorded / max(1.0, episodes):.1f}% of episodes from the task's own start"
+            " distribution. RCG only needs a handful of goal states, so this file is still usable; raise"
+            " --max_steps or --num_envs to collect more."
+        )
     _describe(base_env, pool)
 
     env.close()

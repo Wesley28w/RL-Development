@@ -15,12 +15,11 @@ Point it at both arms of the benchmark and the two CSVs are directly comparable.
 
 Usage:
 
-.. code-block:: bash
+.. code-block:: powershell
 
-    isaaclab.bat -p scripts/rcg/evaluate.py \
-        --task Isaac-Franka-Cabinet-RCG-Direct-v0 \
-        --run_dir logs/rsl_rl/franka_cabinet_rcg/<run> \
-        --episodes 512 --headless
+    # note: ` is PowerShell's line continuation, and nothing may follow it on the line
+    isaaclab.bat -p scripts/rcg/evaluate.py --task Isaac-Franka-Cabinet-RCG-Direct-v0 `
+        --run_dir logs/rsl_rl/franka_cabinet_rcg/<run> --episodes 512 --headless
 """
 
 """Launch Isaac Sim Simulator first."""

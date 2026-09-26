@@ -582,8 +582,10 @@ class RCGMixin:
         cfg = self.cfg.rcg
         if not cfg.goal_state_path:
             raise ValueError(
-                "[RCG] 'rcg.goal_state_path' is not set. Record goal states first with"
-                " 'scripts/rcg/record_goal_states.py'."
+                "[RCG] 'rcg.goal_state_path' is not set. Record goal states with"
+                " 'scripts/rcg/record_goal_states.py', then either use a task configuration that sets the path (such"
+                " as FrankaCabinetRCGEnvCfg) or pass it explicitly via the Hydra override"
+                " 'env.rcg.goal_state_path=<file>'."
             )
         path = os.path.abspath(os.path.expanduser(cfg.goal_state_path))
         if not os.path.isfile(path):

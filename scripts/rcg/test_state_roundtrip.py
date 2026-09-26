@@ -44,7 +44,7 @@ action-space Brownian motion actually moves the task away from the goal.
 
 Usage:
 
-.. code-block:: bash
+.. code-block:: powershell
 
     isaaclab.bat -p scripts/rcg/test_state_roundtrip.py --num_envs 64 --headless
     isaaclab.bat -p scripts/rcg/test_state_roundtrip.py --num_envs 256 --dry_run_expand --headless
@@ -229,8 +229,16 @@ def _dry_run_expand(env) -> bool:
     print("=" * 78)
 
     env.cfg.rcg.enabled = True
+    # --task defaults to the baseline id, whose RCGCfg leaves goal_state_path empty (only the RCG
+    # task configuration sets it). Resolve it here so the dry run works against the baseline env,
+    # which is the one whose capture/restore this script has just verified.
     if args_cli.goal_states is not None:
         env.cfg.rcg.goal_state_path = args_cli.goal_states
+    elif not env.cfg.rcg.goal_state_path:
+        from isaaclab_tasks.direct.franka_cabinet.franka_cabinet_env import DEFAULT_GOAL_STATE_PATH
+
+        env.cfg.rcg.goal_state_path = DEFAULT_GOAL_STATE_PATH
+    print(f"\nGoal-state file: {env.cfg.rcg.goal_state_path}")
 
     goal_states = env._load_goal_states()
     drawer_idx = env.drawer_joint_idx
@@ -252,7 +260,8 @@ def _dry_run_expand(env) -> bool:
     print(f"\nNew start states ({size}):")
     print(f"       drawer_top_joint  mean {drawer.mean():.4f}  min {drawer.min():.4f}  max {drawer.max():.4f}")
     edges = torch.linspace(0.0, max(float(drawer.max()), threshold) + 1e-6, 11, device=drawer.device)
-    counts = torch.bucketize(drawer, edges).bincount(minlength=12)[1:11]
+    # .contiguous(): `drawer` is a column slice, and bucketize warns on non-contiguous input
+    counts = torch.bucketize(drawer.contiguous(), edges).bincount(minlength=12)[1:11]
     print("       histogram of drawer opening:")
     for i in range(10):
         bar = "#" * int(40 * counts[i].item() / max(1, int(counts.max().item())))
