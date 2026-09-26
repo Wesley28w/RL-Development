@@ -25,3 +25,13 @@ gym.register(
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
     },
 )
+
+gym.register(
+    id="Isaac-Franka-Cabinet-RCG-Direct-v0",
+    entry_point=f"{__name__}.franka_cabinet_env:FrankaCabinetEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.franka_cabinet_env:FrankaCabinetRCGEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FrankaCabinetRCGPPORunnerCfg",
+    },
+)

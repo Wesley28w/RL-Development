@@ -36,3 +36,16 @@ class FrankaCabinetPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.008,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class FrankaCabinetRCGPPORunnerCfg(FrankaCabinetPPORunnerCfg):
+    """PPO with reverse curriculum generation over start states.
+
+    Deliberately identical to :class:`FrankaCabinetPPORunnerCfg` in every PPO hyperparameter,
+    so that a comparison between the two isolates the effect of the curriculum. Only the runner
+    class and the log directory differ.
+    """
+
+    class_name = "RCGOnPolicyRunner"
+    experiment_name = "franka_cabinet_rcg"

@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from isaacsim.core.utils.torch.transformations import tf_combine, tf_inverse, tf_vector
@@ -21,6 +23,13 @@ from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.math import sample_uniform
+
+from .rcg_cfg import RCGCfg
+from .rcg_mixin import RCGMixin, StatePool
+
+DEFAULT_GOAL_STATE_PATH = os.path.join(os.path.dirname(__file__), "data", "goal_states_franka_cabinet.pt")
+"""Default location of the recorded goal states, written by ``scripts/rcg/record_goal_states.py``."""
+
 
 @configclass
 class FrankaCabinetEnvCfg(DirectRLEnvCfg):
@@ -156,10 +165,30 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     action_penalty_scale = 0.05
     finger_reward_scale = 2.0
 
-    # curriculum implentation
+    # task success: how far the top drawer must be pulled out
+    drawer_open_threshold = 0.39
+
+    # reverse curriculum generation; disabled here so this configuration is the unmodified
+    # baseline, and enabled by FrankaCabinetRCGEnvCfg below
     rcg: RCGCfg = RCGCfg()
 
-class FrankaCabinetEnv(DirectRLEnv):
+
+@configclass
+class FrankaCabinetRCGEnvCfg(FrankaCabinetEnvCfg):
+    """Franka Cabinet with reverse curriculum generation over start states.
+
+    Identical to :class:`FrankaCabinetEnvCfg` in every respect that affects the MDP -- same
+    observations, same dense reward, same termination, same episode length -- so that the two
+    can be benchmarked against each other. Only the *start-state distribution* differs.
+    """
+
+    rcg: RCGCfg = RCGCfg(
+        enabled=True,
+        goal_state_path=DEFAULT_GOAL_STATE_PATH,
+    )
+
+
+class FrankaCabinetEnv(RCGMixin, DirectRLEnv):
     # pre-physics step calls
     #   |-- _pre_physics_step(action)
     #   |-- _apply_action()
@@ -259,32 +288,9 @@ class FrankaCabinetEnv(DirectRLEnv):
         self.drawer_grasp_rot = torch.zeros((self.num_envs, 4), device=self.device)
         self.drawer_grasp_pos = torch.zeros((self.num_envs, 3), device=self.device)
 
-        self.rcg_pool = {
-            "robot_joint_pos": torch.empty((0, 9), device=self.device),
-            "robot_target_pos": torch.empty((0, 9), device=self.device),
-            "cabinet_joint_pos": torch.empty((0, 1), device=self.device)
-        }
-
-        goal_state = torch.load("successful_state.pt") # need to load successful states from seperate training run
-        self.rcg_good_starts = goal_state
-        self.rcg_old_starts = goal_state
-
-        self.rcg_env_start_id = torch.full(
-            (self.num_envs,),
-            -1,
-            dtype=torch.long,
-            device=self.device
-        )
-
-        self.rcg_start_attempts = torch.zeros(
-            self.rcg_pool_size,
-            device=self.device,
-        )
-
-        self.rcg_start_successes = torch.zeros(
-            self.rcg_pool_size,
-            device=self.device
-        )
+        # reverse curriculum generation buffers; must come last, since the mixin derives the
+        # start-state schema by calling _rcg_capture_state on an empty index set
+        self._rcg_init_buffers()
 
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
@@ -319,7 +325,7 @@ class FrankaCabinetEnv(DirectRLEnv):
     # post-physics step calls
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        terminated = self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.39
+        terminated = self._rcg_is_solved()
         truncated = self.episode_length_buf >= self.max_episode_length - 1
         return terminated, truncated
 
@@ -329,7 +335,7 @@ class FrankaCabinetEnv(DirectRLEnv):
         robot_left_finger_pos = self._robot.data.body_pos_w[:, self.left_finger_link_idx]
         robot_right_finger_pos = self._robot.data.body_pos_w[:, self.right_finger_link_idx]
 
-        return self._compute_rewards(
+        rewards = self._compute_rewards(
             self.actions,
             self._cabinet.data.joint_pos,
             self.robot_grasp_pos,
@@ -351,190 +357,17 @@ class FrankaCabinetEnv(DirectRLEnv):
             self._robot.data.joint_pos,
         )
 
-    def _record_rcg_episode_results(self, env_ids):
-        valid = self.rcg_env_start_id[env_ids] >= 0
+        # the paper's sparse objective, r(s) = 1{s in S^g}. The dense terms above stay in the
+        # logs either way so that the two variants remain comparable.
+        if self.cfg.rcg.sparse_reward:
+            rewards = self._rcg_is_solved().float()
 
-        if not valid.any():
-            return
+        # merge the curriculum diagnostics in here: _compute_rewards assigns extras["log"]
+        # wholesale, so anything written to it earlier in the step would be discarded
+        if self.cfg.rcg.enabled:
+            self.extras["log"].update(self.rcg_log)
 
-        finnished_envs = env_ids[valid]
-        start_ids = self.rcg_env_start_id[finnished_envs]
-        successes = self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > 0.39
-        successes_cropped = successes[finnished_envs].float()      
-
-        ones = torch.ones_like(successes)
-        self.rcg_start_attempts.scatter_add_(
-            0,
-            start_ids,
-            ones,
-        )
-
-        self.rcg_start_successes.scatter_add_(
-            0,
-            start_ids,
-            successes,
-        )  
-
-    def _sample_nearby(self):
-        self.rcg_pool = self._brownian_expand(
-            self.rcg_good_starts
-        )
-
-        self.rcg_pool = self._append_old_starts(
-            new_states=self.rcg_pool,
-            old_states=self.rcg_old_starts,
-        )
-
-    def _select_good_starts(self):
-        attempted = self.rcg_start_attempts > 0
-        rates = torch.zeros_like(
-            self.rcg_start_successes
-        )
-
-        rates[attempted] = (
-            self.rcg_start_successes[attempted]
-            / self.rcg_start_attempts[attempted]
-        )
-
-        good = (
-            attempted
-            & (rates >= self.cfg.rcg.r_min)
-            & (rates <= self.cfg.rcg.r_max)
-        )
-
-        good_ids = torch.where(good)[0]
-
-        return self._index_state_pool(
-            self.rcg_pool,
-            good_ids
-        )
-    
-    def _capture_rcg_state(self, env_ids: torch.Tensor | None):
-        robot_joint_pos = self._robot.data.joint_pos[env_ids].clone()
-        robot_joint_target = self._robot.data.joint_pos_target[env_ids].clone()
-
-        cabinet_joint_pos = self._cabinet.data.joint_pos[env_ids].clone()
-
-        # if using positions remove self.scene.env_origins[env_ids]
-
-        return {
-            "robot_joint_pos": robot_joint_pos,
-            "robot_joint_target": robot_joint_target,
-            "cabinet_joint_pos": cabinet_joint_pos
-        }
-
-    def _restore_rcg_state(self, env_ids: torch.Tensor | None, reset_states):
-        if env_ids is None: return
-        robot_joint_pos = reset_states["robot_joint_pos"]
-        robot_joint_target = reset_states["robot_joint_target"]
-        cabinet_joint_pos = reset_states["cabinet_joint_pos"]
-        # if using position, clone() the value
-
-        # if using position add the self.scene.env_origins[env_ids]
-
-        # static vel on reset
-        robot_joint_vel = torch.zeros_like(robot_joint_pos)
-        cabinet_joint_vel = torch.zeros((len(env_ids), self._cabinet.num_joints), device=self.device)
-
-        # write to sim
-        self._robot.set_joint_position_target(robot_joint_target, env_ids=env_ids)
-        self._robot.write_joint_state_to_sim(robot_joint_pos, robot_joint_vel, env_ids=env_ids)
-        self._cabinet.write_joint_state_to_sim(cabinet_joint_pos, cabinet_joint_vel, env_ids=env_ids)
-
-    def _normal_reset(self, env_ids: torch.Tensor | None):
-        joint_pos = self._robot.data.default_joint_pos[env_ids] + sample_uniform(
-            -0.125,
-            0.125,
-            (len(env_ids), self._robot.num_joints),
-            self.device,
-        )
-        joint_pos = torch.clamp(joint_pos, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
-        joint_vel = torch.zeros_like(joint_pos)
-        self._robot.set_joint_position_target(joint_pos, env_ids=env_ids)
-        self._robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
-
-        # cabinet state
-        zeros = torch.zeros((len(env_ids), self._cabinet.num_joints), device=self.device)
-        self._cabinet.write_joint_state_to_sim(zeros, zeros, env_ids=env_ids)
-
-    def _reset_idx(self, env_ids: torch.Tensor | None):
-
-        # record episode results()
-
-        super()._reset_idx(env_ids)
-        if not self.cfg.rcg.enabled:
-            self._normal_reset(env_ids)
-
-        pool_ids = torch.randint(
-            low=0,
-            high=self.rcg_pool_size,
-            size=(len(env_ids),),
-            device=self.device,
-        )
-
-        reset_states = self._index_state_pool(
-            self.rcg_pool,
-            pool_ids,
-        )
-
-        self._restore_rcg_state(env_ids=env_ids, reset_states=reset_states)
-
-        self.rcg_env_start_id[env_ids] = pool_ids
-
-        # Need to refresh the intermediate values so that _get_observations() can use the latest values
-        self._compute_intermediate_values(env_ids)
-
-    @torch.inference_mode():
-    def advance_rcg_stage(self):
-        # Determine frontier
-        good_starts = self._select_good_starts()
-
-        if self._pool_size(good_starts) == 0:
-            print("[RCG] No good starts yet. Continuing current stage.")
-            return False
-
-        # archive them
-        self.rcg_old_starts = self._concat_state_pools([
-            self.rcg_old_starts,
-            good_starts,
-        ])
-
-        # brownian expansion
-        new_starts = self._brownian_expand(
-            good_starts
-        )
-
-        # replay old good states
-        old_starts = self._sample_state_pool(
-            self.rcg_old_starts,
-            self.cfg.rcg.n_old,
-        )
-
-        # new training distrubtion
-        self.rcg_pool = self._concat_state_pools([
-            new_starts,
-            old_starts,
-        ])
-
-        # reset stats
-        self._reset_rcg_statistics()
-
-        # reset every training env into new distrubiton
-        all_env_ids = torch.arange(
-            self.num_envs,
-            device=self.device,
-            dtype=torch.int32,
-        )
-
-        self._reset_idx(all_env_ids)
-
-        self.scene.write_data_to_sim()
-        self.sim.forward()
-
-        # update since we intemedintly change things
-        self.obs_buf = self._get_observations()
-
-        return True
+        return rewards
 
     def _get_observations(self) -> dict:
         dof_pos_scaled = (
@@ -556,6 +389,126 @@ class FrankaCabinetEnv(DirectRLEnv):
             dim=-1,
         )
         return {"policy": torch.clamp(obs, -5.0, 5.0)}
+
+    # reset
+
+    def _reset_idx(self, env_ids: torch.Tensor):
+        # attribute the outcome of the finishing episodes to the start states that produced
+        # them, and snapshot any success state, before this episode's state is wiped
+        self._record_rcg_episode_results(env_ids)
+        self._rcg_record_goal_states(env_ids)
+
+        super()._reset_idx(env_ids)
+
+        if self.rcg_active:
+            self._rcg_reset_from_pool(env_ids)
+        else:
+            self._normal_reset(env_ids)
+
+        # Need to refresh the intermediate values so that _get_observations() can use the latest values
+        self._compute_intermediate_values(env_ids)
+
+    def _normal_reset(self, env_ids: torch.Tensor):
+        """The task's default start distribution, rho_0 (unchanged from upstream)."""
+        # robot state
+        joint_pos = self._robot.data.default_joint_pos[env_ids] + sample_uniform(
+            -0.125,
+            0.125,
+            (len(env_ids), self._robot.num_joints),
+            self.device,
+        )
+        joint_pos = torch.clamp(joint_pos, self.robot_dof_lower_limits, self.robot_dof_upper_limits)
+        joint_vel = torch.zeros_like(joint_pos)
+        # note: upstream sets the articulation's target but leaves self.robot_dof_targets at
+        # its previous-episode value, even though _pre_physics_step integrates from it. That
+        # leaks state across episodes, so the buffer is reset here too. Applied to this path as
+        # well as the curriculum path so that both arms of the benchmark share identical reset
+        # semantics; set rcg.reset_dof_targets = False to recover the upstream behaviour.
+        if self.cfg.rcg.reset_dof_targets:
+            self.robot_dof_targets[env_ids] = joint_pos
+        self._robot.set_joint_position_target(joint_pos, env_ids=env_ids)
+        self._robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+
+        # cabinet state
+        zeros = torch.zeros((len(env_ids), self._cabinet.num_joints), device=self.device)
+        self._cabinet.write_joint_state_to_sim(zeros, zeros, env_ids=env_ids)
+
+    # reverse curriculum generation hooks
+
+    def _rcg_capture_state(self, env_ids: torch.Tensor) -> StatePool:
+        """Capture everything needed to resume this task from the current state.
+
+        All fields are joint coordinates, so no conversion between world and environment-local
+        frames is needed. Both articulations are fixed-base and their root poses are never
+        written, so the root state is not part of the task's state either.
+        """
+        return {
+            # arm and gripper
+            "robot_joint_pos": self._robot.data.joint_pos[env_ids].clone(),
+            "robot_joint_vel": self._robot.data.joint_vel[env_ids].clone(),
+            # the environment's own integrator state: _pre_physics_step accumulates the action
+            # into this buffer, so a restored state that omits it is not the captured state
+            "robot_dof_targets": self.robot_dof_targets[env_ids].clone(),
+            # all four cabinet joints, not just the top drawer
+            "cabinet_joint_pos": self._cabinet.data.joint_pos[env_ids].clone(),
+            "cabinet_joint_vel": self._cabinet.data.joint_vel[env_ids].clone(),
+        }
+
+    def _rcg_restore_state(self, env_ids: torch.Tensor, state: StatePool) -> None:
+        """Exact inverse of :meth:`_rcg_capture_state`."""
+        robot_joint_pos = state["robot_joint_pos"]
+        robot_joint_vel = state["robot_joint_vel"]
+        cabinet_joint_pos = state["cabinet_joint_pos"]
+        cabinet_joint_vel = state["cabinet_joint_vel"]
+
+        if self.cfg.rcg.zero_velocities_on_restore:
+            robot_joint_vel = torch.zeros_like(robot_joint_vel)
+            cabinet_joint_vel = torch.zeros_like(cabinet_joint_vel)
+
+        self.robot_dof_targets[env_ids] = state["robot_dof_targets"]
+        self._robot.set_joint_position_target(self.robot_dof_targets[env_ids], env_ids=env_ids)
+        self._robot.write_joint_state_to_sim(robot_joint_pos, robot_joint_vel, env_ids=env_ids)
+
+        # the cabinet's joint targets are never commanded away from their defaults, so the
+        # drawer's restoring spring is part of the task dynamics and nothing to restore here
+        self._cabinet.write_joint_state_to_sim(cabinet_joint_pos, cabinet_joint_vel, env_ids=env_ids)
+
+    def _rcg_is_solved(self) -> torch.Tensor:
+        """Binary task success: the top drawer is open past the threshold.
+
+        This is also the task's termination condition, so the two cannot drift apart.
+        """
+        return self._cabinet.data.joint_pos[:, self.drawer_joint_idx] > self.cfg.drawer_open_threshold
+
+    def _rcg_apply_state_noise(self, env_ids: torch.Tensor, std: float) -> None:
+        """Optional Brownian noise on the cabinet joints (documented deviation from the paper).
+
+        The paper's random walk acts purely through the action space. For this task the drawer
+        is under-actuated from the arm's point of view, so if the diagnostics ever show that
+        action-space noise alone does not move the drawer away from the goal, this provides a
+        state-space component. Off by default.
+        """
+        joint_pos = self._cabinet.data.joint_pos[env_ids]
+        noise = torch.randn_like(joint_pos) * std
+        lower = self._cabinet.data.soft_joint_pos_limits[env_ids, :, 0]
+        upper = self._cabinet.data.soft_joint_pos_limits[env_ids, :, 1]
+        joint_pos = torch.clamp(joint_pos + noise, lower, upper)
+        self._cabinet.write_joint_state_to_sim(joint_pos, self._cabinet.data.joint_vel[env_ids], env_ids=env_ids)
+
+    def _rcg_pool_diagnostics(self, pool: StatePool) -> dict[str, torch.Tensor | float]:
+        """How far along the task the current start-state pool sits.
+
+        ``rcg/pool_drawer_mean`` falling across stages is the direct evidence that the
+        curriculum is expanding backwards away from the goal.
+        """
+        if self._pool_size(pool) == 0:
+            return {}
+        drawer = pool["cabinet_joint_pos"][:, self.drawer_joint_idx]
+        return {
+            "rcg/pool_drawer_mean": drawer.mean(),
+            "rcg/pool_drawer_max": drawer.max(),
+            "rcg/pool_drawer_min": drawer.min(),
+        }
 
     # auxiliary methods
 
@@ -582,85 +535,6 @@ class FrankaCabinetEnv(DirectRLEnv):
             self.drawer_local_grasp_rot[env_ids],
             self.drawer_local_grasp_pos[env_ids],
         )
-
-    # physics only step (used for Brownian Motion Application)
-    def _rcg_physics_step(self, actions):
-        # same action preprocessing as normal RL
-        self._pre_physics_step(actions)
-
-        # advance physics only. NO rewards, dones, resets, or ppo
-        
-        for _ in range(self.cfg.decimation):
-            self._apply_action()
-
-            self.scene.write_data_to_sim()
-            self.sim.step(render=False)
-            self.scene.update(
-                dt=self.physics_dt
-            )
-
-    @torch.inference_mode()
-    def _brownian_expand(self, seeds):
-        candidates = []
-
-        while self._pool_length(candidates) < self.cfg.rcg.candidate_count:
-            seed_ids = torch.randint(
-                0,
-                self._pool_size(seeds),
-                (self.num_envs,),
-                device=self.device,
-            )
-
-            batch = self._index_state_pool(
-                seeds,
-                seed_ids
-            )
-
-            all_env_ids = torch.arange(
-                self.num_envs,
-                device=self.device,
-                dtype=torch.int32,
-            )
-
-            for _ in range(self.cfg.rcg.brownian_horizon):
-
-                action = (
-                    torch.randn(
-                        (self.num_envs, self.num_actions),
-                        device = self.device,
-                    )
-                    * self.cfg.rcg.brownian_action_std
-                )
-
-                actions = torch.clamp(
-                    actions,
-                    -1.0,
-                    1.0
-                )
-
-                self._rcg_physics_step(actions)
-
-                # Every visited state is a candidate
-
-                if self.common_step_counter % 4:
-                    candidates.append(
-                        self._capture_rcg_state(all_env_ids)
-                    )
-
-            candidates = self._concat_state_pools(candidates)
-
-            # uniformly select N_new from all generated states
-            perm = torch.randperm(
-                self._pool_size(candidates),
-                device=self.device
-            )
-
-            ids = perm[:self.cfg.rcg.n_new]
-
-            return self._index_state_pool(
-                candidates,
-                ids,
-            )
 
     def _compute_rewards(
         self,
