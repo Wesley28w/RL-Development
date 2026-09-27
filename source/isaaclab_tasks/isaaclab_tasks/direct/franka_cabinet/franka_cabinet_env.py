@@ -34,6 +34,18 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     # reset state curriculum
     reset_state_curriculum_enabled = False # True
 
+    # Whether crossing the success threshold ends the episode.
+    # True reproduces upstream. It is also an incentive conflict: open_reward pays 10 * drawer_pos every step
+    # with no terminal bonus, so ending the episode on success forfeits all remaining reward and the optimal
+    # policy hovers just below the threshold instead of completing the task -- which is what the ~477/500 mean
+    # episode length and the 0.333 mean drawer position in the journal_baseline runs show. False removes the
+    # conflict and matches what factory_env (`return time_out, time_out`) and stack_env ("we DON'T terminate on
+    # success") already do; success then becomes something measured rather than something punished.
+    terminate_on_success = True
+
+    # smoothing for dones/success_rate, applied once per completed episode
+    success_rate_ema_alpha = 0.01
+
     # simulation
     sim: SimulationCfg = SimulationCfg(
         dt=1 / 120,
@@ -328,6 +340,29 @@ class FrankaCabinetEnv(DirectRLEnv):
         self.controller_snapshot_two = None
         self.controller_checked = False
 
+        # Binary task completion, tracked per episode.
+        # `dones/success_rate_margin` is a *graded* measure -- mean(drawer_pos)/0.39 -- so a policy that holds
+        # the drawer at 0.33 forever and never once opens it scores 0.85 on it. These buffers give the actual
+        # completion rate: did the drawer cross the threshold at any point before the episode ended. `solved`
+        # is sticky within an episode so that it survives the drawer springing back closed, and so that it
+        # still works when terminate_on_success is False and episodes always run to the time limit.
+        # `currently_solved` is the instantaneous goal test, refreshed every step by _get_dones.
+        # `episode_solved` is the same thing made sticky for the duration of an episode.
+        # The two give the two success rates below, which differ by exactly the episodes that reached the
+        # goal and then lost it again.
+        self.currently_solved = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.episode_solved = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # terminal success: did the episode *end* in the goal state. The primary metric -- it has no approach
+        # -phase ceiling (unlike solved_frac, whose maximum is (episode_len - time_to_reach)/episode_len), it
+        # cannot be earned by touching the goal once and losing it, and it means the same thing whether or not
+        # terminate_on_success is set: with termination it is the fraction of episodes that ended by success,
+        # without it the fraction that finished holding the drawer open.
+        self.terminal_success_rate = torch.zeros((), device=self.device)
+        # lenient counterpart: did the episode *ever* reach the goal. Saturates at 1.0 for any competent
+        # policy, so it is a yes/no that the task is solvable, not a comparison axis.
+        self.ever_success_rate = torch.zeros((), device=self.device)
+        self.episodes_completed = torch.zeros((), device=self.device)
+
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
         self._cabinet = Articulation(self.cfg.cabinet)
@@ -362,7 +397,11 @@ class FrankaCabinetEnv(DirectRLEnv):
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         drawer_pos = self._cabinet.data.joint_pos[:, self.drawer_joint_idx]
-        terminated = drawer_pos > 0.39
+        solved = drawer_pos > 0.39
+        # sticky within the episode, so a drawer that springs back still counts as completed
+        self.currently_solved = solved
+        self.episode_solved |= solved
+        terminated = solved if self.cfg.terminate_on_success else torch.zeros_like(solved)
         truncated = self.episode_length_buf >= self.max_episode_length - 1
 
         done = terminated | truncated
@@ -381,6 +420,17 @@ class FrankaCabinetEnv(DirectRLEnv):
             natural_mask = ~self.is_curriculum_episode
             success_for_metric = self.overall_success[natural_mask] if natural_mask.any() else self.overall_success
             L["dones/success_rate_margin"] = success_for_metric.mean().item()
+
+            # binary counterparts. `solved_frac` is the fraction of environments sitting in the goal state right
+            # now (factory_env logs its success this way); `dones/success_rate` below is the per-episode rate.
+            solved_for_metric = solved[natural_mask] if natural_mask.any() else solved
+            L["dones/solved_frac"] = solved_for_metric.float().mean().item()
+            L["dones/terminate_on_success"] = float(self.cfg.terminate_on_success)
+            # published here, every step, rather than from _reset_idx: rsl-rl's logger only picks up keys
+            # present in the first step of an iteration, so writing them only on reset steps leaves gaps
+            L["dones/success_rate"] = self.terminal_success_rate
+            L["dones/success_rate_ever"] = self.ever_success_rate
+            L["dones/episodes_completed"] = self.episodes_completed
 
         return terminated, truncated
 
@@ -689,7 +739,26 @@ class FrankaCabinetEnv(DirectRLEnv):
         return rewards
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
+        # record completion for the episodes that are ending, before the sticky flag is cleared below.
+        # Excludes curriculum replays for the same reason dones/success_rate_margin does: they were teleported
+        # into a partially-completed task, so counting them would inflate the number.
+        # episode_length_buf > 0 skips the initial reset of every env, which is not a completed episode
+        natural = (~self.is_curriculum_episode[env_ids]) & (self.episode_length_buf[env_ids] > 0)
+        if natural.any():
+            # terminal: state at the final step of the episode. `currently_solved` was refreshed by _get_dones
+            # earlier in this same step, and the simulator has not been written yet, so it still holds the
+            # end-of-episode value.
+            terminal = self.currently_solved[env_ids][natural].float()
+            ever = self.episode_solved[env_ids][natural].float()
+            # one EMA step per completed episode, applied in a single batched update. A plain per-step mean
+            # would weight steps rather than episodes, and most steps end no episode at all.
+            keep = (1.0 - self.cfg.success_rate_ema_alpha) ** terminal.numel()
+            self.terminal_success_rate = self.terminal_success_rate * keep + terminal.mean() * (1.0 - keep)
+            self.ever_success_rate = self.ever_success_rate * keep + ever.mean() * (1.0 - keep)
+            self.episodes_completed += terminal.numel()
+
         super()._reset_idx(env_ids)
+        self.episode_solved[env_ids] = False
 
         # robot state
         robot_joint_pos = self._robot.data.default_joint_pos[env_ids] + sample_uniform(
