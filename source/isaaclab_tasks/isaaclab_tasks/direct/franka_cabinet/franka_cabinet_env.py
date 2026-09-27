@@ -168,6 +168,9 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     # task success: how far the top drawer must be pulled out
     drawer_open_threshold = 0.39
 
+    # smoothing for the episodic success-rate metric, applied once per completed episode
+    success_rate_ema_alpha = 0.01
+
     # reverse curriculum generation; disabled here so this configuration is the unmodified
     # baseline, and enabled by FrankaCabinetRCGEnvCfg below
     rcg: RCGCfg = RCGCfg()
@@ -288,6 +291,26 @@ class FrankaCabinetEnv(RCGMixin, DirectRLEnv):
         self.drawer_grasp_rot = torch.zeros((self.num_envs, 4), device=self.device)
         self.drawer_grasp_pos = torch.zeros((self.num_envs, 3), device=self.device)
 
+        # -- success metrics, logged in both arms of the benchmark
+        self._success_log: dict[str, torch.Tensor] = {}
+        # EMA over completed episodes, so the curve is readable without a separate eval pass
+        self._episode_success_rate = torch.zeros((), device=self.device)
+        self._episodes_completed = torch.zeros((), device=self.device)
+        self._eval_success_rate = torch.zeros((), device=self.device)
+        self._eval_episodes_completed = torch.zeros((), device=self.device)
+
+        # environments held out of the curriculum and always reset from rho_0. A contiguous block
+        # rather than a random draw, so the split is identical across seeds and runs.
+        self._is_eval_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        num_eval = int(round(self.cfg.rcg.eval_env_fraction * self.num_envs))
+        num_eval = max(0, min(num_eval, self.num_envs - 1))
+        if num_eval > 0:
+            self._is_eval_env[:num_eval] = True
+            print(
+                f"[RCG] Holding {num_eval} of {self.num_envs} environments out of the curriculum; they always reset"
+                " from the task's own start distribution and drive the 'dones/eval_*' metrics."
+            )
+
         # reverse curriculum generation buffers; must come last, since the mixin derives the
         # start-state schema by calling _rcg_capture_state on an empty index set
         self._rcg_init_buffers()
@@ -325,8 +348,19 @@ class FrankaCabinetEnv(RCGMixin, DirectRLEnv):
     # post-physics step calls
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        drawer_pos = self._cabinet.data.joint_pos[:, self.drawer_joint_idx]
+        # via the shared helper, so the termination test and the success test cannot drift apart
         terminated = self._rcg_is_solved()
         truncated = self.episode_length_buf >= self.max_episode_length - 1
+
+        # graded progress toward the goal, 0.0 = closed, 1.0 = open past the threshold. Defined
+        # identically to the reset-pose-curriculum branch's 'dones/success_rate_margin' so that
+        # curves from the two branches can be overlaid directly.
+        margin = torch.clamp(drawer_pos / self.cfg.drawer_open_threshold, 0.0, 1.0)
+        self._success_log["dones/success_rate_margin"] = margin.mean()
+        if bool(self._is_eval_env.any()):
+            self._success_log["dones/eval_success_rate_margin"] = margin[self._is_eval_env].mean()
+
         return terminated, truncated
 
     def _get_rewards(self) -> torch.Tensor:
@@ -362,8 +396,9 @@ class FrankaCabinetEnv(RCGMixin, DirectRLEnv):
         if self.cfg.rcg.sparse_reward:
             rewards = self._rcg_is_solved().float()
 
-        # merge the curriculum diagnostics in here: _compute_rewards assigns extras["log"]
-        # wholesale, so anything written to it earlier in the step would be discarded
+        # merge the metrics in here: _compute_rewards assigns extras["log"] wholesale, so
+        # anything written to it earlier in the step (by _get_dones or _reset_idx) is discarded
+        self.extras["log"].update(self._success_log)
         if self.cfg.rcg.enabled:
             self.extras["log"].update(self.rcg_log)
 
@@ -397,16 +432,58 @@ class FrankaCabinetEnv(RCGMixin, DirectRLEnv):
         # them, and snapshot any success state, before this episode's state is wiped
         self._record_rcg_episode_results(env_ids)
         self._rcg_record_goal_states(env_ids)
+        self._update_success_metrics(env_ids)
 
         super()._reset_idx(env_ids)
 
         if self.rcg_active:
-            self._rcg_reset_from_pool(env_ids)
+            # environments held out of the curriculum keep starting from rho_0, so that something
+            # comparable to the baseline is measurable while the curriculum runs
+            eval_mask = self._is_eval_env[env_ids]
+            if bool(eval_mask.any()):
+                self._normal_reset(env_ids[eval_mask])
+                curriculum_ids = env_ids[~eval_mask]
+            else:
+                curriculum_ids = env_ids
+            if curriculum_ids.numel() > 0:
+                self._rcg_reset_from_pool(curriculum_ids)
         else:
             self._normal_reset(env_ids)
 
         # Need to refresh the intermediate values so that _get_observations() can use the latest values
         self._compute_intermediate_values(env_ids)
+
+    def _update_success_metrics(self, env_ids: torch.Tensor):
+        """Track binary per-episode success for the episodes finishing this step.
+
+        ``reset_terminated`` is the task's success condition, already computed by
+        :meth:`~isaaclab.envs.DirectRLEnv.step` for this step, so success is read rather than
+        recomputed. Kept as an EMA over *completed episodes* -- a per-step mean would weight
+        steps rather than episodes, and most steps end no episode at all.
+        """
+        successes = self.reset_terminated[env_ids].float()
+        if successes.numel() == 0:
+            return
+
+        alpha = self.cfg.success_rate_ema_alpha
+
+        def update(current: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+            # applying a per-episode alpha to a batch of n episodes at once
+            keep = (1.0 - alpha) ** batch.numel()
+            return current * keep + batch.mean() * (1.0 - keep)
+
+        self._episode_success_rate = update(self._episode_success_rate, successes)
+        self._episodes_completed += successes.numel()
+        self._success_log["dones/success_rate"] = self._episode_success_rate
+        self._success_log["dones/episodes_completed"] = self._episodes_completed
+
+        if bool(self._is_eval_env.any()):
+            eval_successes = self.reset_terminated[env_ids][self._is_eval_env[env_ids]].float()
+            if eval_successes.numel() > 0:
+                self._eval_success_rate = update(self._eval_success_rate, eval_successes)
+                self._eval_episodes_completed += eval_successes.numel()
+            self._success_log["dones/eval_success_rate"] = self._eval_success_rate
+            self._success_log["dones/eval_episodes_completed"] = self._eval_episodes_completed
 
     def _normal_reset(self, env_ids: torch.Tensor):
         """The task's default start distribution, rho_0 (unchanged from upstream)."""

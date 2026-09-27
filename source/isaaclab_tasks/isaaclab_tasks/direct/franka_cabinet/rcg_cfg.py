@@ -214,3 +214,22 @@ class RCGCfg:
 
     log_diagnostics: bool = True
     """Whether to publish ``rcg/*`` diagnostics through ``extras["log"]``."""
+
+    eval_env_fraction: float = 0.0
+    """Fraction of environments held out of the curriculum and always reset from ``rho_0``.
+
+    Without this, *nothing* logged during RCG training is comparable to a baseline or to the
+    reset-pose curriculum: RCG teleports every environment, so every episode starts from a
+    curriculum state and the success rate measures the curriculum, not the task. The held-out
+    environments give a live ``dones/eval_*`` curve on the task's own start distribution.
+
+    Defaults to ``0.0``, which is the paper's behaviour. ``0.0625`` (a sixteenth) is a
+    reasonable benchmark setting.
+
+    .. warning::
+        Documented deviation from the paper when non-zero. The held-out environments are
+        excluded from the curriculum's start-state statistics, but their transitions still enter
+        the PPO rollout, so a small fraction of training data comes from ``rho_0`` rather than
+        from ``rho_i``. Use :mod:`scripts.rcg.evaluate` for numbers that must be free of that
+        caveat.
+    """

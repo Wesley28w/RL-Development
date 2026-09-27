@@ -39,6 +39,13 @@ parser.add_argument("--run_dir", type=str, required=True, help="Run directory co
 parser.add_argument("--num_envs", type=int, default=256, help="Number of environments to simulate.")
 parser.add_argument("--episodes", type=int, default=512, help="Complete episodes to evaluate per checkpoint.")
 parser.add_argument("--every", type=int, default=1, help="Evaluate every n-th checkpoint.")
+parser.add_argument(
+    "--checkpoint",
+    type=str,
+    default=None,
+    help="Evaluate only this checkpoint (a path, or a bare name like 'model_2499.pt') instead of the whole run.",
+)
+parser.add_argument("--last", action="store_true", default=False, help="Evaluate only the final checkpoint.")
 parser.add_argument("--output", type=str, default=None, help="Output CSV path. Defaults to <run_dir>/rho0_eval.csv.")
 parser.add_argument("--seed", type=int, default=12345, help="Seed for the evaluation environment.")
 parser.add_argument(
@@ -91,9 +98,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
 
     run_dir = os.path.abspath(args_cli.run_dir)
     checkpoints = sorted(glob.glob(os.path.join(run_dir, "model_*.pt")), key=_iteration_of)
-    checkpoints = [path for path in checkpoints if _iteration_of(path) >= 0][:: max(1, args_cli.every)]
+    checkpoints = [path for path in checkpoints if _iteration_of(path) >= 0]
     if not checkpoints:
         raise FileNotFoundError(f"No 'model_*.pt' checkpoints found in '{run_dir}'.")
+
+    if args_cli.checkpoint is not None:
+        one = args_cli.checkpoint
+        if not os.path.isabs(one) and not os.path.exists(one):
+            one = os.path.join(run_dir, os.path.basename(one))
+        if not os.path.isfile(one):
+            raise FileNotFoundError(f"Checkpoint not found: '{args_cli.checkpoint}'.")
+        checkpoints = [os.path.abspath(one)]
+    elif args_cli.last:
+        checkpoints = checkpoints[-1:]
+    else:
+        checkpoints = checkpoints[:: max(1, args_cli.every)]
+
     output_path = args_cli.output or os.path.join(run_dir, "rho0_eval.csv")
 
     env = gym.make(args_cli.task, cfg=env_cfg)
