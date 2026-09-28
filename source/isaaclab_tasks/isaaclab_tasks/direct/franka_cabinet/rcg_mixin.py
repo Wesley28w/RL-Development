@@ -602,12 +602,16 @@ class RCGMixin:
         # validate against the schema the task actually captures
         expected = self._empty_state_pool()
         missing = sorted(set(expected) - set(pool))
-        extra = sorted(set(pool) - set(expected))
-        if missing or extra:
+        if missing:
             raise ValueError(
-                f"[RCG] Goal-state schema mismatch in '{path}'. Missing keys: {missing}. Unexpected keys: {extra}."
+                f"[RCG] Goal-state schema mismatch in '{path}'. Missing keys: {missing}."
                 " Re-record the goal states with the current environment."
             )
+        extra = sorted(set(pool) - set(expected))
+        if extra:
+            # tolerated rather than fatal, so a file recorded before a field was dropped from the
+            # state schema stays usable; the surplus fields are simply not restored
+            print(f"[RCG] Ignoring {len(extra)} unused field(s) in '{os.path.basename(path)}': {extra}")
         pool = {key: pool[key].to(device=self.device, dtype=expected[key].dtype) for key in expected}
         for key, value in pool.items():
             if value.ndim != 2 or value.shape[1] != expected[key].shape[1]:

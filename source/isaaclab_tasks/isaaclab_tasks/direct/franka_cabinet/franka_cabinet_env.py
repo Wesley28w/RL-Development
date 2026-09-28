@@ -513,7 +513,18 @@ class FrankaCabinetEnv(RCGMixin, DirectRLEnv):
     # reverse curriculum generation hooks
 
     def _rcg_capture_state(self, env_ids: torch.Tensor) -> StatePool:
-        """Capture everything needed to resume this task from the current state.
+        """Capture the start state: joint positions only.
+
+        Deliberately the same 13 numbers the reset-pose curriculum stores (9 arm/gripper joint
+        positions + 4 cabinet joint positions, see its ``success_buffer``), so that neither
+        curriculum carries state the other does not and the benchmark comparison is not
+        confounded. Velocities and the action-target buffer are *not* stored: they are set to a
+        canonical rest condition on restore, exactly as the reset-pose curriculum does.
+
+        Documented deviation from Florensa et al., whose start states are genuine visited states
+        including velocity. Restoring a position-only state is still physically valid -- it is the
+        same class of state the task's own reset produces -- but it is not a bit-exact replay of
+        the captured moment.
 
         All fields are joint coordinates, so no conversion between world and environment-local
         frames is needed. Both articulations are fixed-base and their root poses are never
@@ -522,27 +533,26 @@ class FrankaCabinetEnv(RCGMixin, DirectRLEnv):
         return {
             # arm and gripper
             "robot_joint_pos": self._robot.data.joint_pos[env_ids].clone(),
-            "robot_joint_vel": self._robot.data.joint_vel[env_ids].clone(),
-            # the environment's own integrator state: _pre_physics_step accumulates the action
-            # into this buffer, so a restored state that omits it is not the captured state
-            "robot_dof_targets": self.robot_dof_targets[env_ids].clone(),
             # all four cabinet joints, not just the top drawer
             "cabinet_joint_pos": self._cabinet.data.joint_pos[env_ids].clone(),
-            "cabinet_joint_vel": self._cabinet.data.joint_vel[env_ids].clone(),
         }
 
     def _rcg_restore_state(self, env_ids: torch.Tensor, state: StatePool) -> None:
-        """Exact inverse of :meth:`_rcg_capture_state`."""
+        """Restore a start state, bringing the rest of the simulation to a canonical rest."""
         robot_joint_pos = state["robot_joint_pos"]
-        robot_joint_vel = state["robot_joint_vel"]
         cabinet_joint_pos = state["cabinet_joint_pos"]
-        cabinet_joint_vel = state["cabinet_joint_vel"]
 
-        if self.cfg.rcg.zero_velocities_on_restore:
-            robot_joint_vel = torch.zeros_like(robot_joint_vel)
-            cabinet_joint_vel = torch.zeros_like(cabinet_joint_vel)
+        # at rest, matching the task's own reset (`joint_vel = torch.zeros_like(robot_joint_pos)`)
+        robot_joint_vel = torch.zeros_like(robot_joint_pos)
+        cabinet_joint_vel = torch.zeros_like(cabinet_joint_pos)
 
-        self.robot_dof_targets[env_ids] = state["robot_dof_targets"]
+        # Re-anchor the action integrator on the pose being restored, rather than storing and
+        # replaying the captured target. This matches what the reset-pose curriculum does
+        # (`self.robot_dof_targets[env_ids] = robot_joint_pos`), so both curricula carry the same
+        # information in their start states and the comparison is not confounded by RCG having
+        # extra state. Note: not literally zeroed -- commanding every joint to 0 would slam the
+        # arm across its workspace on every reset.
+        self.robot_dof_targets[env_ids] = robot_joint_pos
         self._robot.set_joint_position_target(self.robot_dof_targets[env_ids], env_ids=env_ids)
         self._robot.write_joint_state_to_sim(robot_joint_pos, robot_joint_vel, env_ids=env_ids)
 

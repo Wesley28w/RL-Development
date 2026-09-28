@@ -164,13 +164,6 @@ class RCGCfg:
     # State definition.
     ##
 
-    zero_velocities_on_restore: bool = False
-    """Zero all velocities when restoring a start state.
-
-    ``False`` (the default) restores the genuine visited state, which is what makes restore
-    the exact inverse of capture. ``True`` is available as an ablation.
-    """
-
     reset_dof_targets: bool = True
     """Reset the environment's joint-position-target buffer on every reset.
 
