@@ -7,14 +7,20 @@
 
 RCG assumes that a single state in which the task is achieved, ``s^g``, is given as prior
 knowledge (Florensa et al., CoRL 2017). This script produces that prior by rolling out a
-trained policy on the *baseline* task and snapshotting the simulator state at the exact instant
-each environment succeeds.
+trained policy and snapshotting the simulator state at the exact instant each environment
+succeeds. Task-agnostic: it works on any task whose configuration has an ``rcg`` field, and it
+writes whatever that task's ``_rcg_capture_state`` defines as a start state.
 
-Why a trained policy rather than a hand-built state: the informative curriculum dimension for
-Franka Cabinet is the arm configuration, not the drawer opening. A state with the drawer open
-but the gripper parked at its default pose is physically valid yet useless as a goal, because
-expanding backwards from it never produces starts in which the gripper is near the handle. A
-partially trained checkpoint is enough -- only a few hundred success states are needed.
+Why a trained policy rather than a hand-built state: the informative curriculum dimension is the
+*robot* configuration, not the task's progress variable. A state with the drawer open (or the
+cube hovering at the goal) but the gripper parked at its default pose is physically valid yet
+useless as a goal, because expanding backwards from it never produces starts in which the
+gripper is anywhere near the object. A partially trained checkpoint is enough -- only a few
+hundred success states are needed.
+
+The curriculum is switched off, so the rollout runs from the task's own start distribution.
+Point ``--task`` at the RCG task id and the recorder still records from ``rho_0``; the checkpoint
+may come from either arm.
 
 Usage:
 
@@ -23,6 +29,9 @@ Usage:
     # note: ` is PowerShell's line continuation, and nothing may follow it on the line
     isaaclab.bat -p scripts/rcg/record_goal_states.py --task Isaac-Franka-Cabinet-Direct-v0 `
         --checkpoint logs/rsl_rl/franka_cabinet_direct/<run>/model_1499.pt --num_states 1000 --headless
+
+    isaaclab.bat -p scripts/rcg/record_goal_states.py --task Isaac-Lift-Cube-Franka-RCG-v0 `
+        --checkpoint logs/rsl_rl/franka_lift_baseline/<run>/model_1499.pt --num_states 1000 --headless
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -34,11 +43,13 @@ import sys
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Record RCG goal states from a trained policy.")
-parser.add_argument("--task", type=str, default="Isaac-Franka-Cabinet-Direct-v0", help="Name of the baseline task.")
+parser.add_argument("--task", type=str, required=True, help="Name of the task to record from.")
 parser.add_argument("--checkpoint", type=str, required=True, help="Path to the trained model checkpoint.")
 parser.add_argument("--num_states", type=int, default=1000, help="Number of goal states to record.")
 parser.add_argument("--num_envs", type=int, default=256, help="Number of environments to simulate.")
-parser.add_argument("--output", type=str, default=None, help="Output .pt path. Defaults to the task's data directory.")
+parser.add_argument(
+    "--output", type=str, default=None, help="Output .pt path. Defaults to the task's own 'rcg.goal_state_path'."
+)
 parser.add_argument("--max_steps", type=int, default=5000, help="Give up after this many environment steps.")
 parser.add_argument("--seed", type=int, default=42, help="Seed for the environment.")
 parser.add_argument(
@@ -87,11 +98,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
     env_cfg.rcg.enabled = False
 
     resume_path = retrieve_file_path(args_cli.checkpoint)
-    output_path = args_cli.output
-    if output_path is None:
-        from isaaclab_tasks.direct.franka_cabinet.franka_cabinet_env import DEFAULT_GOAL_STATE_PATH
-
-        output_path = DEFAULT_GOAL_STATE_PATH
+    # the task's configuration is the single source of truth for where its goal states live, so
+    # that a run and the recorder can never disagree about the path
+    output_path = args_cli.output or env_cfg.rcg.goal_state_path
+    if not output_path:
+        raise ValueError(
+            f"Task '{args_cli.task}' does not set 'rcg.goal_state_path', so there is no default output location."
+            " Pass --output explicitly."
+        )
     output_path = os.path.abspath(output_path)
 
     env = gym.make(args_cli.task, cfg=env_cfg)
@@ -159,17 +173,32 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg, agent_cfg: RslRlBaseRun
 
 
 def _describe(base_env, pool) -> None:
-    """Print the spread of the recorded set, so a degenerate recording is obvious immediately."""
-    drawer = pool["cabinet_joint_pos"][:, base_env.drawer_joint_idx]
+    """Print the spread of the recorded set, so a degenerate recording is obvious immediately.
+
+    Reports every field the task captures rather than a hand-picked one, since the whole point of
+    the state schema being the task's business is that this script does not know what is in it.
+    """
     print("[INFO] Recorded goal states:")
-    print(f"       drawer_top_joint : mean {drawer.mean():.4f}  min {drawer.min():.4f}  max {drawer.max():.4f}")
-    print(f"       success threshold: {base_env.cfg.drawer_open_threshold}")
-    joint_std = pool["robot_joint_pos"].std(dim=0)
-    print(f"       arm joint std    : {[f'{v:.3f}' for v in joint_std.tolist()]}")
-    if float(joint_std.max()) < 1e-3:
+    widest = 0.0
+    for key, value in sorted(pool.items()):
+        spread = value.std(dim=0)
+        widest = max(widest, float(spread.max()))
+        print(f"       {key:<18} std {[f'{v:.3f}' for v in spread.tolist()]}")
+
+    try:
+        progress = base_env._rcg_pool_progress(pool)
+    except NotImplementedError:
+        pass
+    else:
         print(
-            "[WARNING] All recorded goal states share essentially the same arm configuration. The curriculum will"
-            " expand from a single pose; consider recording with more environments or a noisier policy."
+            f"       {'progress to goal':<18} mean {progress.mean():.4f}  min {progress.min():.4f} "
+            f" max {progress.max():.4f}   (1.0 = in the goal set)"
+        )
+
+    if widest < 1e-3:
+        print(
+            "[WARNING] All recorded goal states share essentially the same configuration. The curriculum will expand"
+            " from a single pose; consider recording with more environments or a less converged policy."
         )
 
 

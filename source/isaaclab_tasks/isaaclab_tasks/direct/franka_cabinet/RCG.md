@@ -51,38 +51,57 @@ Three details of the paper that are easy to get wrong and are honoured here:
 - Candidate feasibility is guaranteed **by construction**. States come from real rollouts of
   the simulator, never from noise injected directly into state space.
 
-Paper hyperparameters are the defaults in `rcg_cfg.py`: `R_min = 0.1`, `R_max = 0.9`,
+Paper hyperparameters are the defaults in `isaaclab_tasks/utils/rcg/rcg_cfg.py`: `R_min = 0.1`, `R_max = 0.9`,
 `N_new = 200`, `N_old = 100`, `M = 10_000`, `T_B = 50`, `Sigma = I`.
 
 ---
 
 ## Files
 
+The curriculum itself is shared with Franka Lift and lives outside this task.
+
 | File | Role |
 |---|---|
-| `rcg_cfg.py` | `RCGCfg`. Pure config, no RL-library dependency. |
-| `rcg_mixin.py` | `RCGMixin`. Pools, statistics, selection, Brownian expansion, stage scheduling. Task-agnostic apart from three hooks. |
-| `franka_cabinet_env.py` | The three hooks, plus `FrankaCabinetRCGEnvCfg`. |
+| `isaaclab_tasks/utils/rcg/rcg_cfg.py` | `RCGCfg`. Pure config, no RL-library and no task dependency. |
+| `isaaclab_tasks/utils/rcg/rcg_mixin.py` | `RCGMixin`. Pools, statistics, selection, Brownian expansion, stage scheduling. Task- and workflow-agnostic behind seven hooks. |
+| `isaaclab_tasks/utils/rcg/workflow_mixins.py` | `RCGDirectMixin` / `RCGManagerBasedMixin`. The four places the curriculum touches the environment loop, per workflow. |
+| `rcg_cfg.py`, `rcg_mixin.py` | Re-export shims, so this task's old import paths still resolve. `RCGMixin` here is `RCGDirectMixin`. |
+| `franka_cabinet_env.py` | The three task hooks, plus `FrankaCabinetRCGEnvCfg`. |
 | `agents/rsl_rl_ppo_cfg.py` | `FrankaCabinetRCGPPORunnerCfg` — identical PPO hyperparameters, different runner. |
 | `isaaclab_rl/rsl_rl/rcg_runner.py` | `RCGOnPolicyRunner`. Decides *when* a stage ends; nothing else. |
-| `scripts/rcg/record_goal_states.py` | Produces `s^g` from a trained checkpoint. |
-| `scripts/rcg/test_state_roundtrip.py` | Gate test for capture/restore, plus a SampleNearby dry run. |
+| `scripts/rcg/record_goal_states.py` | Produces `s^g` from a trained checkpoint. Task-agnostic. |
+| `scripts/rcg/test_state_roundtrip.py` | Gate test for capture/restore, plus a SampleNearby dry run. Task-agnostic. |
 | `scripts/rcg/evaluate.py` | Measures success rate from `rho_0`. The number the benchmark reports. |
+| `scripts/rcg/quick_drawer_eval.py` | Per-seed drawer report from `rho_0`, with per-group mean ± sd. |
 
-The state is captured as joint coordinates only:
+By default the state is captured as joint **positions** only:
 
 | field | shape | why |
 |---|---|---|
-| `robot_joint_pos` | `(N, 9)` | |
-| `robot_joint_vel` | `(N, 9)` | a genuine visited state, so velocities are kept |
-| `robot_dof_targets` | `(N, 9)` | the environment's own integrator state (see below) |
+| `robot_joint_pos` | `(N, 9)` | arm and gripper |
 | `cabinet_joint_pos` | `(N, 4)` | all four joints, not only the top drawer |
+
+Thirteen numbers, deliberately the same thirteen the reset-pose curriculum stores, so that neither
+curriculum carries state the other does not and the benchmark comparison is not confounded. On
+restore, velocities are set to zero and `robot_dof_targets` is re-anchored on the pose being
+restored, which is exactly what the reset-pose curriculum does.
+
+`rcg.capture_full_state = True` adds the three fields that make a restore a genuine continuation:
+
+| field | shape | why |
+|---|---|---|
+| `robot_joint_vel` | `(N, 9)` | a genuine visited state, so velocities are kept |
 | `cabinet_joint_vel` | `(N, 4)` | |
+| `robot_dof_targets` | `(N, 9)` | the environment's own integrator state — `_pre_physics_step` integrates from this buffer, not from the articulation's commanded target |
+
+The positions-only default is a documented deviation from Florensa et al., and the section "Verify
+capture/restore" below measures exactly what it costs. Flipping the flag invalidates a recorded
+goal-state file; `_load_goal_states` notices and says so.
 
 Both articulations are fixed-base and their root poses are never written, so root state is not
 part of the MDP state here. Nothing in the dict is a world-frame position, so the
 `scene.env_origins` conversion that other tasks need does not arise — `_rcg_capture_state`'s
-docstring spells out the rule for tasks where it does.
+docstring spells out the rule for tasks where it does, and Franka Lift is the task where it does.
 
 ---
 
@@ -226,28 +245,51 @@ backwards from such a state never produces starts with the gripper near the hand
 ### 3. Verify capture/restore before trusting anything
 
 ```powershell
-isaaclab.bat -p scripts/rcg/test_state_roundtrip.py --num_envs 64 --headless
-isaaclab.bat -p scripts/rcg/test_state_roundtrip.py --num_envs 256 --dry_run_expand --headless
+isaaclab.bat -p scripts/rcg/test_state_roundtrip.py --task Isaac-Franka-Cabinet-Direct-v0 --num_envs 64 --headless
+isaaclab.bat -p scripts/rcg/test_state_roundtrip.py --task Isaac-Franka-Cabinet-Direct-v0 --num_envs 64 --headless env.rcg.capture_full_state=true
+isaaclab.bat -p scripts/rcg/test_state_roundtrip.py --task Isaac-Franka-Cabinet-Direct-v0 --num_envs 256 --dry_run_expand --headless
 ```
 
-Measured on 64 environments:
+Measured on 32 environments, 20 replay steps, both tasks and both state schemas:
 
-| check | result |
-|---|---|
-| round trip (capture → scramble → restore → capture) | `0.0` on all five fields |
-| determinism control (same restore replayed twice) | `0.0` on all five fields |
-| replay residual vs. the natural trajectory | `6.1e-4` rad on joint positions, `2.6e-3` rad/s on joint velocities — `7e-4` of the `0.84` rad the trajectory travelled |
+| task | `rcg.capture_full_state` | round trip | determinism control | replay residual / motion |
+|---|---|---|---|---|
+| Franka Cabinet | `False` (default) | `0.0` on every field | `0.0` | **1.19** |
+| Franka Cabinet | `True` | `0.0` on every field | `0.0` | `1.5e-6` |
+| Franka Lift | `False` (default) | `0.0` on every field | `0.0` | **0.144** |
+| Franka Lift | `True` | `0.0` on every field | `0.0` | `2.9e-6` |
 
-So restore is exactly reproducible, but a replayed trajectory drifts slightly from the natural
-one. That remainder is **not** a missing field: it lives in PhysX articulation solver caches and
-contact impulses, which Isaac Lab's `Articulation` API does not expose, so no addition to the
-state dict can capture it. It is bounded, and at `7e-4` of the motion it is orders of magnitude
-below the ±0.125 rad reset randomisation the task already applies to every episode — which is
-the standard by which it should be judged.
+Read that table carefully, because it says something that is easy to get backwards.
 
-The test's gate is therefore relative (residual ≤ 5% of the motion) rather than a fixed absolute
-tolerance. **If it fails, stop.** Every part of RCG rests on this, and no amount of correct
-curriculum logic can compensate for start states the policy can never actually be in.
+Restore is **exactly** reproducible on both tasks and at both settings — the control is `0.0`
+everywhere, so nothing here is simulator nondeterminism. With the full state, a replayed trajectory
+matches the natural one to `1.5e-6` of the distance it travelled on cabinet and `2.9e-6` on lift:
+capture/restore is complete, and there is no meaningful PhysX residual left over, not even with a
+cube held between two fingers.
+
+The large numbers in the `False` rows are therefore **not** drift and **not** a defect. They are the
+direct, measured cost of the positions-only decision: a restore zeroes velocities, so a replay
+starts from rest where the natural trajectory had momentum, and 20 steps later the arm is somewhere
+else entirely. This is exactly what the run-time restore does on every curriculum reset. A
+position-only start state is still a *valid* state — it is the same class of state the task's own
+reset produces, which is why the curriculum works — but it is **not** the state that was captured,
+and "restore and continue is equivalent to having arrived here naturally" is false at that setting.
+
+So the dynamics-equivalence check gates only when `rcg.capture_full_state` is set, and at the
+default it prints the residual as a measurement. The round trip and the determinism control gate
+always. **If either of those fails, stop.**
+
+Which setting to use is an experimental-design choice, not a correctness one:
+
+- `False` keeps RCG's start states carrying exactly the information the reset-pose curriculum's
+  carry, so a comparison between the two curricula is not confounded by RCG having extra state.
+  This is the benchmark default, and it is what the existing cabinet results were produced with.
+- `True` is faithful to Florensa et al., whose start states are genuine visited states including
+  velocity, and is the only setting at which the pool provably contains the states it recorded.
+
+Run the gate test **both ways** on any new task: at the default to see what positions-only costs,
+and with `env.rcg.capture_full_state=true` to check that the schema is actually complete, which is
+where a real bug would show up.
 
 ### 4. RCG training
 
@@ -332,14 +374,14 @@ Two non-obvious constraints, both found by running the thing rather than by read
 - **`advance_rcg_stage()` discards in-flight episodes.** This matches the paper's alternation
   between training and curriculum-generation phases, but it does mean a fraction of collected
   experience ends mid-episode at every stage boundary.
-- **Restore is not bit-identical to the natural trajectory.** Reproducible, and within `7e-4` of
-  the motion, but not exact — see the table above. The residual is PhysX solver state that is not
-  reachable through the `Articulation` API. If a future task turns out to be sensitive to it, the
-  fix is a simulator-level state snapshot, not more fields in `_rcg_capture_state`.
-- **Lift and Factory are not wired up.** `RCGMixin` is task-agnostic behind three hooks
-  (`_rcg_capture_state`, `_rcg_restore_state`, `_rcg_is_solved`), so adding them is a matter of
-  declaring the state and the success condition — but no such code exists yet. Those tasks have
-  free-floating objects, so their `_rcg_capture_state` **must** convert object positions to
-  environment-local coordinates by subtracting `scene.env_origins[env_ids]`; environment clones
-  sit at different world offsets, and storing absolute world positions is the easiest way to
-  break this silently.
+- **At the positions-only default, restore is not a continuation of the captured trajectory.**
+  It is exactly reproducible, and it is a valid state, but the velocities are gone — measured at
+  `1.19 ×` the motion over 20 steps, see the table above. `rcg.capture_full_state = True` removes
+  this entirely (`1.5e-6`), at the cost of no longer matching the reset-pose curriculum's state.
+- **Factory is not wired up.** Franka Lift is: see
+  `isaaclab_tasks/manager_based/manipulation/lift/RCG.md`. Adding Factory is a matter of picking the
+  adapter for its workflow and implementing the same three hooks (`_rcg_capture_state`,
+  `_rcg_restore_state`, `_rcg_is_solved`). It has free-floating objects, so its
+  `_rcg_capture_state` **must** convert object positions to environment-local coordinates by
+  subtracting `scene.env_origins[env_ids]`; environment clones sit at different world offsets, and
+  storing absolute world positions is the easiest way to break this silently.

@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import os
 from dataclasses import MISSING
 
 import isaaclab.sim as sim_utils
@@ -21,7 +22,12 @@ from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdF
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
+from isaaclab_tasks.utils.rcg import RCGCfg
+
 from . import mdp
+
+DEFAULT_GOAL_STATE_PATH = os.path.join(os.path.dirname(__file__), "data", "goal_states_franka_lift.pt")
+"""Default location of the recorded RCG goal states, written by ``scripts/rcg/record_goal_states.py``."""
 
 ##
 # Scene definition
@@ -205,6 +211,68 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventCfg = EventCfg()
     curriculum: CurriculumCfg = CurriculumCfg()
+
+    ##
+    # Task success, and reverse curriculum generation over start states.
+    #
+    # Inert on this configuration: nothing here is read unless the environment class is
+    # `LiftRCGEnv`, and `rcg.enabled` is False, so `Isaac-Lift-Cube-Franka-v0` and the IK variants
+    # are unaffected. See `config/franka/lift_rcg_env_cfg.py` for the two benchmark arms.
+    ##
+
+    success_threshold = 0.02
+    """How close the object must get to the commanded goal position to count as success, in metres.
+
+    Not a termination condition: Franka Lift ends an episode only on time-out or on dropping the
+    object, and that is left alone. Success here is something *measured*. The value matches the
+    threshold the reset-pose curriculum's ``lift_success_rate`` metric uses, so the two curricula's
+    curves are on one scale, and it is well inside the ``0.05`` ``std`` of the
+    ``object_goal_tracking_fine_grained`` reward term. No separate height test is needed: the
+    commanded goal sits at ``z`` in ``(0.25, 0.5)`` and the cube rests at ``z ~ 0.055``, so the
+    object cannot be within 2 cm of the goal without having been lifted.
+    """
+
+    success_rate_ema_alpha = 0.01
+    """Smoothing for the episodic success-rate metrics, applied once per completed episode."""
+
+    rcg: RCGCfg = RCGCfg(
+        goal_state_path=DEFAULT_GOAL_STATE_PATH,
+        # Franka Lift's episode is 250 steps, half of Franka Cabinet's, so the same "300 starts x
+        # 8 episodes" stage budget is half the environment steps. See RCGCfg.policy_steps_per_stage.
+        policy_steps_per_stage=600_000,
+        max_policy_steps_per_stage=2_000_000,
+        # this task does not terminate on success, so a start state one step from the goal would
+        # otherwise be scored on whether the policy can *hold* the goal for 250 steps rather than
+        # on whether it can reach it. See RCGCfg.episode_success_mode.
+        episode_success_mode="ever",
+        # The paper's T_B = 50 does not transfer to this task, and using it is the difference
+        # between a curriculum that works and one that does nothing. 50 steps at 50 Hz is a full
+        # second of random joint targets applied to an arm holding a cube: the cube is long gone and
+        # the arm has wandered anywhere. Measured with `--dry_run_expand` over 256 environments, the
+        # progress of the generated starts (1.0 = in the goal set, goal states measure 0.99):
+        #
+        #   T_B = 50   mean 0.20, spread flat across [0, 1]   <- indistinguishable from random
+        #   T_B = 10   mean 0.75, concentrated in [0.5, 1.0]   <- a real difficulty gradient
+        #   T_B =  3   mean 0.90, all inside [0.8, 1.0]        <- too close, mostly mastered
+        #
+        # At 50 the new starts are unsolvable and the replayed archive starts are trivial, so every
+        # start's success rate is exactly 0 or exactly 1, `select()` finds nothing in (r_min, r_max)
+        # and the curriculum never advances on its own merits. Franka Cabinet tolerates T_B = 50
+        # because its drawer is spring-loaded and the arm stays near the handle; a free cube has no
+        # such restoring force. Re-run `--dry_run_expand` if the object, the gripper or the episode
+        # rate changes -- the right value depends on all three.
+        brownian_horizon=10,
+    )
+    """Reverse curriculum generation. Disabled by default; enabled by ``FrankaCubeLiftRCGEnvCfg``."""
+
+    progress_reference_distance = 0.35
+    """Object-to-goal distance treated as "the start of the task" when reporting pool progress.
+
+    Only used by ``_rcg_pool_progress``, which is a reporting quantity -- nothing in the curriculum
+    reads it. ``0.35`` m is roughly the object-to-goal distance at a fresh ``rho_0`` start: the cube
+    rests at ``z ~ 0.055`` and the goal is sampled in ``z`` in ``(0.25, 0.5)`` with up to 0.25 m of
+    lateral offset.
+    """
 
     def __post_init__(self):
         """Post initialization."""

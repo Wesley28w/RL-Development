@@ -6,6 +6,9 @@ import gymnasium as gym
 
 from . import agents
 
+LIFT_RCG_ENTRY_POINT = "isaaclab_tasks.manager_based.manipulation.lift.lift_rcg_env:LiftRCGEnv"
+"""Environment class shared by both arms of the reverse-curriculum benchmark."""
+
 ##
 # Register Gym environments.
 ##
@@ -36,6 +39,43 @@ gym.register(
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
         "sb3_cfg_entry_point": f"{agents.__name__}:sb3_ppo_cfg.yaml",
+    },
+    disable_env_checker=True,
+)
+
+##
+# Reverse Curriculum Generation benchmark
+#
+# Two arms, one environment class, one difference: where an episode starts. Both are separate from
+# `Isaac-Lift-Cube-Franka-v0`, which stays exactly as upstream ships it.
+##
+
+gym.register(
+    id="Isaac-Lift-Cube-Franka-Baseline-v0",
+    entry_point=LIFT_RCG_ENTRY_POINT,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.lift_rcg_env_cfg:FrankaCubeLiftBaselineEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:LiftCubeBaselinePPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Lift-Cube-Franka-RCG-v0",
+    entry_point=LIFT_RCG_ENTRY_POINT,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.lift_rcg_env_cfg:FrankaCubeLiftRCGEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:LiftCubeRCGPPORunnerCfg",
+    },
+    disable_env_checker=True,
+)
+
+gym.register(
+    id="Isaac-Lift-Cube-Franka-RCG-Play-v0",
+    entry_point=LIFT_RCG_ENTRY_POINT,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.lift_rcg_env_cfg:FrankaCubeLiftRCGEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:LiftCubeRCGPPORunnerCfg",
     },
     disable_env_checker=True,
 )

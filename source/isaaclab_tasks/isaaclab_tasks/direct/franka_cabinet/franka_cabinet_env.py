@@ -172,8 +172,11 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     success_rate_ema_alpha = 0.01
 
     # reverse curriculum generation; disabled here so this configuration is the unmodified
-    # baseline, and enabled by FrankaCabinetRCGEnvCfg below
-    rcg: RCGCfg = RCGCfg()
+    # baseline, and enabled by FrankaCabinetRCGEnvCfg below. The goal-state path is set on this
+    # configuration rather than only on the RCG one because it is never read while 'enabled' is
+    # False, and because the RCG tooling (the recorder, the gate test) runs against the baseline
+    # task with the curriculum switched off and still has to know where the file lives.
+    rcg: RCGCfg = RCGCfg(goal_state_path=DEFAULT_GOAL_STATE_PATH)
 
 
 @configclass
@@ -513,46 +516,66 @@ class FrankaCabinetEnv(RCGMixin, DirectRLEnv):
     # reverse curriculum generation hooks
 
     def _rcg_capture_state(self, env_ids: torch.Tensor) -> StatePool:
-        """Capture the start state: joint positions only.
+        """Capture the start state.
 
-        Deliberately the same 13 numbers the reset-pose curriculum stores (9 arm/gripper joint
-        positions + 4 cabinet joint positions, see its ``success_buffer``), so that neither
-        curriculum carries state the other does not and the benchmark comparison is not
-        confounded. Velocities and the action-target buffer are *not* stored: they are set to a
-        canonical rest condition on restore, exactly as the reset-pose curriculum does.
+        By default, joint **positions** only: deliberately the same 13 numbers the reset-pose
+        curriculum stores (9 arm/gripper joint positions + 4 cabinet joint positions, see its
+        ``success_buffer``), so that neither curriculum carries state the other does not and the
+        benchmark comparison is not confounded. Velocities and the action-target buffer are then not
+        stored, and are set to a canonical rest condition on restore, exactly as the reset-pose
+        curriculum does.
 
-        Documented deviation from Florensa et al., whose start states are genuine visited states
-        including velocity. Restoring a position-only state is still physically valid -- it is the
-        same class of state the task's own reset produces -- but it is not a bit-exact replay of
-        the captured moment.
+        That default is a documented deviation from Florensa et al., whose start states are genuine
+        visited states including velocity. Restoring a position-only state is still physically valid
+        -- it is the same class of state the task's own reset produces -- but it is not a replay of
+        the captured moment, which is why the gate test's dynamics-equivalence check does not gate at
+        this setting. ``rcg.capture_full_state = True`` stores the rest and makes it a real gate; see
+        that flag's docstring.
 
         All fields are joint coordinates, so no conversion between world and environment-local
         frames is needed. Both articulations are fixed-base and their root poses are never
         written, so the root state is not part of the task's state either.
         """
-        return {
+        state = {
             # arm and gripper
             "robot_joint_pos": self._robot.data.joint_pos[env_ids].clone(),
             # all four cabinet joints, not just the top drawer
             "cabinet_joint_pos": self._cabinet.data.joint_pos[env_ids].clone(),
         }
+        if self.cfg.rcg.capture_full_state:
+            state["robot_joint_vel"] = self._robot.data.joint_vel[env_ids].clone()
+            state["cabinet_joint_vel"] = self._cabinet.data.joint_vel[env_ids].clone()
+            # the environment's own integrator state: _pre_physics_step integrates from this buffer,
+            # not from the articulation's commanded target, so a continuation that does not restore
+            # it is not the same continuation
+            state["robot_dof_targets"] = self.robot_dof_targets[env_ids].clone()
+        return state
 
     def _rcg_restore_state(self, env_ids: torch.Tensor, state: StatePool) -> None:
-        """Restore a start state, bringing the rest of the simulation to a canonical rest."""
+        """Restore a start state. Inverse of :meth:`_rcg_capture_state`.
+
+        Fields the pool does not carry are restored to a canonical rest, which is what makes the
+        position-only default a valid state rather than an arbitrary one.
+        """
         robot_joint_pos = state["robot_joint_pos"]
         cabinet_joint_pos = state["cabinet_joint_pos"]
 
         # at rest, matching the task's own reset (`joint_vel = torch.zeros_like(robot_joint_pos)`)
-        robot_joint_vel = torch.zeros_like(robot_joint_pos)
-        cabinet_joint_vel = torch.zeros_like(cabinet_joint_pos)
+        robot_joint_vel = state.get("robot_joint_vel")
+        if robot_joint_vel is None:
+            robot_joint_vel = torch.zeros_like(robot_joint_pos)
+        cabinet_joint_vel = state.get("cabinet_joint_vel")
+        if cabinet_joint_vel is None:
+            cabinet_joint_vel = torch.zeros_like(cabinet_joint_pos)
 
-        # Re-anchor the action integrator on the pose being restored, rather than storing and
-        # replaying the captured target. This matches what the reset-pose curriculum does
+        # Re-anchor the action integrator on the pose being restored, rather than replaying the
+        # captured target. This matches what the reset-pose curriculum does
         # (`self.robot_dof_targets[env_ids] = robot_joint_pos`), so both curricula carry the same
         # information in their start states and the comparison is not confounded by RCG having
         # extra state. Note: not literally zeroed -- commanding every joint to 0 would slam the
         # arm across its workspace on every reset.
-        self.robot_dof_targets[env_ids] = robot_joint_pos
+        dof_targets = state.get("robot_dof_targets")
+        self.robot_dof_targets[env_ids] = robot_joint_pos if dof_targets is None else dof_targets
         self._robot.set_joint_position_target(self.robot_dof_targets[env_ids], env_ids=env_ids)
         self._robot.write_joint_state_to_sim(robot_joint_pos, robot_joint_vel, env_ids=env_ids)
 
@@ -596,6 +619,15 @@ class FrankaCabinetEnv(RCGMixin, DirectRLEnv):
             "rcg/pool_drawer_max": drawer.max(),
             "rcg/pool_drawer_min": drawer.min(),
         }
+
+    def _rcg_pool_progress(self, pool: StatePool) -> torch.Tensor:
+        """Drawer opening as a fraction of the success threshold, clipped to ``[0, 1]``.
+
+        The same quantity as the ``dones/success_rate_margin`` logged during training, so the
+        gate test's histogram and the training curve are measured on one scale.
+        """
+        drawer = pool["cabinet_joint_pos"][:, self.drawer_joint_idx]
+        return torch.clamp(drawer / self.cfg.drawer_open_threshold, 0.0, 1.0)
 
     # auxiliary methods
 

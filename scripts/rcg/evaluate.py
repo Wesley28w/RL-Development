@@ -13,6 +13,11 @@ from ``rho_0`` with the curriculum switched off.
 
 Point it at both arms of the benchmark and the two CSVs are directly comparable.
 
+Success is read from ``rcg_last_episode_success``, which the environment latches from ``_reset_idx``
+while the finished episode's state is still readable. That indirection matters for a task that does
+not terminate on success -- Franka Lift ends every episode on its time limit, so ``reset_terminated``
+would report ``0`` for a perfectly solved episode.
+
 Usage:
 
 .. code-block:: powershell
@@ -20,6 +25,9 @@ Usage:
     # note: ` is PowerShell's line continuation, and nothing may follow it on the line
     isaaclab.bat -p scripts/rcg/evaluate.py --task Isaac-Franka-Cabinet-RCG-Direct-v0 `
         --run_dir logs/rsl_rl/franka_cabinet_rcg/<run> --episodes 512 --headless
+
+    isaaclab.bat -p scripts/rcg/evaluate.py --task Isaac-Lift-Cube-Franka-RCG-v0 `
+        --run_dir logs/rsl_rl/franka_lift_rcg/<run> --episodes 512 --headless
 """
 
 """Launch Isaac Sim Simulator first."""
@@ -175,7 +183,7 @@ def _evaluate(env, base_env, policy, device) -> dict:
             num_finished = int(finished.sum().item())
             if num_finished:
                 episodes += num_finished
-                successes += int(base_env.reset_terminated[finished].sum().item())
+                successes += int(base_env.rcg_last_episode_success[finished].sum().item())
                 total_length += int(lengths[finished].sum().item()) + num_finished
 
     return {
