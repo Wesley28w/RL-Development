@@ -15,6 +15,7 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.math import axis_angle_from_quat, sample_uniform
+from isaaclab_tasks.utils.tscl_window import TSCLWindowTeacher
 
 from . import factory_control, factory_utils
 from .factory_env_cfg import OBS_DIM_CFG, STATE_DIM_CFG, FactoryEnvCfg
@@ -62,6 +63,32 @@ class FactoryEnv(DirectRLEnv):
             dtype=torch.long,
             device=self.device,
         )
+
+        # TSCL is an alternative scheduler over Factory's existing empirical reset categories. It neither
+        # creates states nor changes restoration, dynamics, rewards, observations, or PPO configuration.
+        self.tscl_teacher: TSCLWindowTeacher | None = None
+        if self.cfg.reset_curriculum_mode not in {"aces", "tscl_window"}:
+            raise ValueError(
+                f"Unknown reset_curriculum_mode={self.cfg.reset_curriculum_mode!r}; "
+                "expected 'aces' or 'tscl_window'."
+            )
+        if self.cfg.reset_curriculum_mode == "tscl_window" and self.cfg.task_name != "nut_thread":
+            raise ValueError(
+                "The Factory TSCL benchmark is intentionally restricted to Franka NutThread; "
+                f"got task_name={self.cfg.task_name!r}."
+            )
+        if self.cfg.reset_state_curriculum_enabled and self.cfg.reset_curriculum_mode == "tscl_window":
+            self.tscl_teacher = TSCLWindowTeacher(
+                3,
+                self.device,
+                history_size=self.cfg.tscl_history_size,
+                min_history=self.cfg.tscl_min_history,
+                alpha=self.cfg.tscl_alpha,
+                temperature=self.cfg.tscl_temperature,
+                min_samples=self.cfg.tscl_min_samples,
+                update_interval_iterations=self.cfg.tscl_update_interval_iterations,
+                exploration_fraction=self.cfg.tscl_exploration_fraction,
+            )
 
         # Controller
         self.progress = 0.0 # for tracking progression (0.0-1.0)
@@ -536,9 +563,16 @@ class FactoryEnv(DirectRLEnv):
                     self.pose_buffer_idx[task] = (
                         start + count
                     ) % self.cfg.success_buffer_size
-                    self.pose_buffer_count[task] = torch.clamp(
-                        self.pose_buffer_count[task] + count, max=self.cfg.success_buffer_size
-                    )
+                self.pose_buffer_count[task] = torch.clamp(
+                    self.pose_buffer_count[task] + count, max=self.cfg.success_buffer_size
+                )
+
+        if self.tscl_teacher is not None:
+            ppo_iteration = self.common_step_counter // self.cfg.tscl_rollout_steps_per_iteration
+            global_env_steps = self.common_step_counter * self.num_envs
+            available_tasks = self.pose_buffer_count > 0
+            self.tscl_teacher.update_if_due(ppo_iteration, global_env_steps, available_tasks)
+            self.distribution = self.tscl_teacher.get_distribution(available_tasks)
 
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
@@ -602,6 +636,15 @@ class FactoryEnv(DirectRLEnv):
                 L["env_compare/replay_task_success_gap_mean"] = (gap.mean().item())
                 for i in range(3):
                     L[f"env_compare/replay_task_success_gap_{i+1}"] = (gap[i].item())
+
+            if self.tscl_teacher is not None:
+                ppo_iteration = self.common_step_counter // self.cfg.tscl_rollout_steps_per_iteration
+                global_env_steps = self.common_step_counter * self.num_envs
+                available_tasks = self.pose_buffer_count > 0
+                L.update(self.tscl_teacher.metrics(ppo_iteration, global_env_steps, available_tasks))
+                L["tscl/rollout_steps_per_iteration"] = self.cfg.tscl_rollout_steps_per_iteration
+                L["tscl/standard_reset_fraction"] = 1.0 - self.cfg.sampling_ratio
+                L["tscl/curriculum_reset_fraction"] = self.cfg.sampling_ratio
 
     def _update_distribution(self):
         # mask to remove curriculum episodes from compute
@@ -731,13 +774,17 @@ class FactoryEnv(DirectRLEnv):
             1.0,
         )
         # run controller for choosing enable/disable
-        if self.cfg.reset_state_curriculum_enabled and self.cfg.controller_enabled:
+        if (
+            self.cfg.reset_state_curriculum_enabled
+            and self.cfg.reset_curriculum_mode == "aces"
+            and self.cfg.controller_enabled
+        ):
             self._run_curriculum_controller()
 
         # # custom curriclum work
         self._update_progression() # update data each step
         # uses the updated progressions
-        if self.common_step_counter % 10 == 0:
+        if self.cfg.reset_curriculum_mode == "aces" and self.common_step_counter % 10 == 0:
             self._update_distribution()
 
         # Get successful and failed envs at current timestep
@@ -823,6 +870,19 @@ class FactoryEnv(DirectRLEnv):
 
     def _reset_idx(self, env_ids):
         """We assume all envs will always be reset at the same time."""
+        # Record the just-finished episodes before replacing their category labels or clearing progression.
+        # Factory's existing end-of-episode success criterion is computed in _get_dones and stored in
+        # overall_success. These teacher observations never enter the environment reward or PPO buffer.
+        if self.tscl_teacher is not None:
+            successes = (
+                self.overall_success[env_ids].bool()
+                if isinstance(self.overall_success, torch.Tensor)
+                else torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
+            )
+            self.tscl_teacher.record_episode_outcomes(
+                self.curriculum_subtask[env_ids], successes
+            )
+
         super()._reset_idx(env_ids)
         held_state = self._held_asset.data.default_root_state.clone()[env_ids] # (7)
         fixed_state = self._fixed_asset.data.default_root_state.clone()[env_ids] # (7)
@@ -870,9 +930,13 @@ class FactoryEnv(DirectRLEnv):
                 picked_env_ids = env_ids[picked]
 
                 # sample subtasks, restricted to ones that actually have recorded poses
-                masked_distribution = torch.where(
-                    valid_subtasks, self.distribution, torch.zeros_like(self.distribution)
-                )
+                if self.tscl_teacher is not None:
+                    masked_distribution = self.tscl_teacher.get_distribution(valid_subtasks)
+                    self.distribution = masked_distribution
+                else:
+                    masked_distribution = torch.where(
+                        valid_subtasks, self.distribution, torch.zeros_like(self.distribution)
+                    )
                 mass = masked_distribution.sum()
                 if mass <= 0:
                     # the curriculum's preferred subtask(s) have no recorded poses yet
@@ -888,6 +952,8 @@ class FactoryEnv(DirectRLEnv):
                 )
 
                 self.curriculum_subtask[picked_env_ids] = subtasks
+                if self.tscl_teacher is not None:
+                    self.tscl_teacher.record_reset_draws(subtasks)
 
                 # sample stored worlds (env-local poses; buffer is shared across envs),
                 # clamped to the slots that have actually been written for that subtask

@@ -56,6 +56,7 @@ import torch
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import ManagerTermBase, SceneEntityCfg
 from isaaclab.utils.math import combine_frame_transforms, sample_uniform
+from isaaclab_tasks.utils.tscl_window import TSCLWindowTeacher
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -126,6 +127,23 @@ class subtask_progression_tracker(ManagerTermBase):
         self.pose_buffer_count = torch.zeros(NUM_SUBTASKS, dtype=torch.long, device=env.device)
         self.success_rate = torch.zeros(NUM_SUBTASKS, device=env.device)
         self.distribution = torch.softmax(torch.ones(NUM_SUBTASKS, device=env.device), dim=0)
+
+        # TSCL is an opt-in scheduler over the exact same empirical state banks. Keeping the teacher on the
+        # tracker makes its lifetime and category labels identical to ACES while leaving the PPO learner
+        # untouched. The default ``aces`` mode does not instantiate or consult this object.
+        self.tscl_teacher: TSCLWindowTeacher | None = None
+        if getattr(env.cfg, "reset_curriculum_mode", "aces") == "tscl_window":
+            self.tscl_teacher = TSCLWindowTeacher(
+                NUM_SUBTASKS,
+                env.device,
+                history_size=env.cfg.tscl_history_size,
+                min_history=env.cfg.tscl_min_history,
+                alpha=env.cfg.tscl_alpha,
+                temperature=env.cfg.tscl_temperature,
+                min_samples=env.cfg.tscl_min_samples,
+                update_interval_iterations=env.cfg.tscl_update_interval_iterations,
+                exploration_fraction=env.cfg.tscl_exploration_fraction,
+            )
 
         # written externally by sample_curriculum_reset_state
         self.is_curriculum_episode = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
@@ -213,8 +231,26 @@ class subtask_progression_tracker(ManagerTermBase):
                     self.pose_buffer_count[task] + count, max=env.cfg.success_buffer_size
                 )
 
-        if torch.rand((), device=env.device) < update_distribution_prob:
-            self._update_distribution(env)
+        curriculum_mode = getattr(env.cfg, "reset_curriculum_mode", "aces")
+        if curriculum_mode == "aces":
+            if torch.rand((), device=env.device) < update_distribution_prob:
+                self._update_distribution(env)
+        elif curriculum_mode == "tscl_window":
+            if self.tscl_teacher is None:
+                raise RuntimeError("TSCL mode is active but its Window teacher was not initialized.")
+            ppo_iteration = env.common_step_counter // env.cfg.tscl_rollout_steps_per_iteration
+            global_env_steps = env.common_step_counter * env.num_envs
+            available_tasks = self.pose_buffer_count > 0
+            self.tscl_teacher.update_if_due(ppo_iteration, global_env_steps, available_tasks)
+            self.distribution = self.tscl_teacher.get_distribution(available_tasks)
+            self._log.update(self.tscl_teacher.metrics(ppo_iteration, global_env_steps, available_tasks))
+            self._log["tscl/rollout_steps_per_iteration"] = env.cfg.tscl_rollout_steps_per_iteration
+            self._log["tscl/standard_reset_fraction"] = 1.0 - env.cfg.sampling_ratio
+            self._log["tscl/curriculum_reset_fraction"] = env.cfg.sampling_ratio
+        else:
+            raise ValueError(
+                f"Unknown reset_curriculum_mode={curriculum_mode!r}; expected 'aces' or 'tscl_window'."
+            )
 
         self._log.update({
             f"subtasks/success_{i + 1}": self.progression[:, i].float().mean().item() for i in range(NUM_SUBTASKS)
@@ -222,6 +258,19 @@ class subtask_progression_tracker(ManagerTermBase):
         self._log["curriculum/highest_subtask"] = self.progression.float().sum(dim=1).mean().item()
 
         return zero_reward
+
+    def record_tscl_episode_outcomes(self, env_ids: torch.Tensor, successes: torch.Tensor) -> None:
+        """Update the TSCL teacher from completed episodes without changing the student reward.
+
+        The empirical reset category is the TSCL task, and ``successes`` is the lift environment's existing
+        final-task success criterion evaluated at episode end. Ordinary/default-reset episodes have category
+        ``-1`` and therefore do not update the teacher.
+        """
+        if self.tscl_teacher is None:
+            raise RuntimeError("TSCL mode is active but its Window teacher was not initialized.")
+
+        env_ids = torch.as_tensor(env_ids, device=self.curriculum_subtask.device, dtype=torch.long)
+        self.tscl_teacher.record_episode_outcomes(self.curriculum_subtask[env_ids], successes)
 
     def _get_subtasks(
         self,
@@ -399,13 +448,21 @@ def sample_curriculum_reset_state(
 
     # restrict the sampling distribution to subtasks that have recorded poses; if the curriculum has
     # committed all of its mass to subtasks that have none, fall back to uniform over the ones that do
-    masked_distribution = torch.where(valid_subtasks, tracker.distribution, torch.zeros_like(tracker.distribution))
+    if getattr(env.cfg, "reset_curriculum_mode", "aces") == "tscl_window":
+        if tracker.tscl_teacher is None:
+            raise RuntimeError("TSCL mode is active but its Window teacher was not initialized.")
+        masked_distribution = tracker.tscl_teacher.get_distribution(valid_subtasks)
+        tracker.distribution = masked_distribution
+    else:
+        masked_distribution = torch.where(valid_subtasks, tracker.distribution, torch.zeros_like(tracker.distribution))
     if masked_distribution.sum() <= 0:
         masked_distribution = valid_subtasks.float()
     masked_distribution = masked_distribution / masked_distribution.sum()
 
     subtasks = torch.multinomial(masked_distribution, num_picked, replacement=True)
     tracker.curriculum_subtask[picked_ids] = subtasks
+    if tracker.tscl_teacher is not None:
+        tracker.tscl_teacher.record_reset_draws(subtasks)
 
     # draw only from slots that have actually been written for the chosen subtask
     max_valid = tracker.pose_buffer_count[subtasks].clamp(min=1)

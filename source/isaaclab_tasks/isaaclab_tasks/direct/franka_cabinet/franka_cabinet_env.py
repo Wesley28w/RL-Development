@@ -21,6 +21,7 @@ from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.math import sample_uniform
+from isaaclab_tasks.utils.tscl_window import TSCLWindowTeacher
 
 @configclass
 class FrankaCabinetEnvCfg(DirectRLEnvCfg):
@@ -33,6 +34,9 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
 
     # reset state curriculum
     reset_state_curriculum_enabled = False # True
+    # ``aces`` preserves the existing empirical-difficulty scheduler; ``tscl_window`` changes only the
+    # reset-category probabilities while reusing the same state banks and restoration path.
+    reset_curriculum_mode = "aces"
 
     # simulation
     sim: SimulationCfg = SimulationCfg(
@@ -173,6 +177,18 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     greedy_margin_lo = 0.5
     greedy_margin_hi = 1.5
     min_subtask_prob = 0.05 # floor on each subtask's sampling probability so none can be starved
+
+    # Shared TSCL-style Window-teacher parameters. The interval is normalized to 100 teacher-update
+    # opportunities over Cabinet's unchanged 2500 RSL-RL iterations.
+    tscl_history_size = 10
+    tscl_min_history = 5
+    tscl_alpha = 0.1
+    tscl_temperature = 0.0004
+    tscl_min_samples = 8
+    tscl_update_interval_iterations = 25
+    tscl_exploration_fraction = 0.20
+    # Must match the unchanged RSL-RL num_steps_per_env for this direct Cabinet benchmark.
+    tscl_rollout_steps_per_iteration = 16
     
     # policy params
     curriculum_total_iterations = 2500
@@ -319,6 +335,27 @@ class FrankaCabinetEnv(DirectRLEnv):
             dtype=torch.long,
             device=self.device,
         )
+
+        # The empirical reset category is the TSCL task. The teacher changes only the distribution over
+        # these four existing banks; it never changes rewards, observations, dynamics, or PPO data.
+        self.tscl_teacher: TSCLWindowTeacher | None = None
+        if self.cfg.reset_curriculum_mode not in {"aces", "tscl_window"}:
+            raise ValueError(
+                f"Unknown reset_curriculum_mode={self.cfg.reset_curriculum_mode!r}; "
+                "expected 'aces' or 'tscl_window'."
+            )
+        if self.cfg.reset_state_curriculum_enabled and self.cfg.reset_curriculum_mode == "tscl_window":
+            self.tscl_teacher = TSCLWindowTeacher(
+                4,
+                self.device,
+                history_size=self.cfg.tscl_history_size,
+                min_history=self.cfg.tscl_min_history,
+                alpha=self.cfg.tscl_alpha,
+                temperature=self.cfg.tscl_temperature,
+                min_samples=self.cfg.tscl_min_samples,
+                update_interval_iterations=self.cfg.tscl_update_interval_iterations,
+                exploration_fraction=self.cfg.tscl_exploration_fraction,
+            )
         
         # Controller
         self.progress = 0.0 # for tracking progression (0.0-1.0)
@@ -468,6 +505,13 @@ class FrankaCabinetEnv(DirectRLEnv):
                         max=self.cfg.success_buffer_size,
                     )
 
+        if self.tscl_teacher is not None:
+            ppo_iteration = self.common_step_counter // self.cfg.tscl_rollout_steps_per_iteration
+            global_env_steps = self.common_step_counter * self.num_envs
+            available_tasks = self.pose_buffer_count > 0
+            self.tscl_teacher.update_if_due(ppo_iteration, global_env_steps, available_tasks)
+            self.distribution = self.tscl_teacher.get_distribution(available_tasks)
+
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
             success = self.progression[:, :, 0]
@@ -516,6 +560,15 @@ class FrankaCabinetEnv(DirectRLEnv):
                     L[f"env_compare/replay_task_success_gap_{i+1}"] = (gap[i].item())
             # sample counting
             L[f"env_compare/replay_count_{task+1}"] = mask.sum().item()
+
+            if self.tscl_teacher is not None:
+                ppo_iteration = self.common_step_counter // self.cfg.tscl_rollout_steps_per_iteration
+                global_env_steps = self.common_step_counter * self.num_envs
+                available_tasks = self.pose_buffer_count > 0
+                L.update(self.tscl_teacher.metrics(ppo_iteration, global_env_steps, available_tasks))
+                L["tscl/rollout_steps_per_iteration"] = self.cfg.tscl_rollout_steps_per_iteration
+                L["tscl/standard_reset_fraction"] = 1.0 - self.cfg.sampling_ratio
+                L["tscl/curriculum_reset_fraction"] = self.cfg.sampling_ratio
 
     def _update_distribution(self):
         # mask to remove curriculum episodes from compute
@@ -639,15 +692,23 @@ class FrankaCabinetEnv(DirectRLEnv):
             1.0,
         )
         # run controller for choosing enable/disable
-        if self.cfg.reset_state_curriculum_enabled and self.cfg.controller_enabled:
+        if (
+            self.cfg.reset_state_curriculum_enabled
+            and self.cfg.reset_curriculum_mode == "aces"
+            and self.cfg.controller_enabled
+        ):
             self._run_curriculum_controller()
 
         # # custom curriclum work
         self._update_progression() # update data each step
         # uses the updated progressions
-        if self.cfg.reset_state_curriculum_enabled:
+        if self.cfg.reset_state_curriculum_enabled and self.cfg.reset_curriculum_mode == "aces":
             if torch.rand((), device=self.device) < 0.10:
                 self._update_distribution()
+        elif self.cfg.reset_state_curriculum_enabled and self.cfg.reset_curriculum_mode == "tscl_window":
+            if self.tscl_teacher is None:
+                raise RuntimeError("TSCL mode is active but its Window teacher was not initialized.")
+            self.distribution = self.tscl_teacher.get_distribution(self.pose_buffer_count > 0)
         else: # keep determinisitc by not messing with the rand generator
             if self.common_step_counter % 10 == 0:
                 self._update_distribution()
@@ -689,6 +750,13 @@ class FrankaCabinetEnv(DirectRLEnv):
         return rewards
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
+        # Record the just-finished, category-labelled episodes before reset clears their labels. The success
+        # test is exactly the environment's existing termination criterion; teacher statistics never enter
+        # the reward or PPO rollout buffer.
+        if self.tscl_teacher is not None:
+            successes = self._cabinet.data.joint_pos[env_ids, self.drawer_joint_idx] > 0.39
+            self.tscl_teacher.record_episode_outcomes(self.curriculum_subtask[env_ids], successes)
+
         super()._reset_idx(env_ids)
 
         # robot state
@@ -737,9 +805,13 @@ class FrankaCabinetEnv(DirectRLEnv):
                 # sample subtasks, restricted to ones that actually have recorded poses. if the distribution
                 # has committed all of its mass to subtasks with no data, fall back to uniform over the ones
                 # that do have data.
-                masked_distribution = torch.where(
-                    valid_subtasks, self.distribution, torch.zeros_like(self.distribution)
-                )
+                if self.tscl_teacher is not None:
+                    masked_distribution = self.tscl_teacher.get_distribution(valid_subtasks)
+                    self.distribution = masked_distribution
+                else:
+                    masked_distribution = torch.where(
+                        valid_subtasks, self.distribution, torch.zeros_like(self.distribution)
+                    )
                 if masked_distribution.sum() <= 0:
                     masked_distribution = valid_subtasks.float()
                 masked_distribution = masked_distribution / masked_distribution.sum()
@@ -751,6 +823,8 @@ class FrankaCabinetEnv(DirectRLEnv):
                 )
 
                 self.curriculum_subtask[env_ids[picked]] = subtasks
+                if self.tscl_teacher is not None:
+                    self.tscl_teacher.record_reset_draws(subtasks)
 
                 # sample stored worlds, clamped to the slots that have actually been written for that subtask
                 max_valid = self.pose_buffer_count[subtasks].clamp(min=1)

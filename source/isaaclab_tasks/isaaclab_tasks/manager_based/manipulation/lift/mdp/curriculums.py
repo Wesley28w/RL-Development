@@ -66,25 +66,42 @@ class lift_success_rate(ManagerTermBase):
         # subtask_progression_tracker is registered as a reward term (see mdp/events.py's module docstring
         # for why), so it must be looked up through the reward manager rather than the event manager.
         tracker_term_cfg = getattr(env.reward_manager.cfg, tracker_term_name, None)
+        tracker = tracker_term_cfg.func if tracker_term_cfg is not None else None
+
         if tracker_term_cfg is not None:
-            is_curriculum_episode = tracker_term_cfg.func.is_curriculum_episode[env_ids]
+            is_curriculum_episode = tracker.is_curriculum_episode[env_ids]
             natural_ids = env_ids[~is_curriculum_episode]
         else:
             natural_ids = env_ids
 
-        if natural_ids.numel() == 0:
-            return self._last_value
-
-        robot: RigidObject = env.scene[robot_cfg.name]
-        object: RigidObject = env.scene[object_cfg.name]
-        command = env.command_manager.get_command(command_name)
-
-        # goal position in the world frame for the (natural) environments that just finished an episode
-        des_pos_w, _ = combine_frame_transforms(
-            robot.data.root_pos_w[natural_ids], robot.data.root_quat_w[natural_ids], command[natural_ids, :3]
-        )
-        distance = torch.norm(des_pos_w - object.data.root_pos_w[natural_ids], dim=1)
-        self._last_value = (distance < threshold).float().mean()
+        # Preserve the original ACES/default metric path exactly. TSCL additionally measures its own
+        # category-labelled episodes with the same success criterion, but only when explicitly selected.
+        if tracker is not None and tracker.tscl_teacher is not None:
+            robot: RigidObject = env.scene[robot_cfg.name]
+            object: RigidObject = env.scene[object_cfg.name]
+            command = env.command_manager.get_command(command_name)
+            des_pos_w, _ = combine_frame_transforms(
+                robot.data.root_pos_w[env_ids], robot.data.root_quat_w[env_ids], command[env_ids, :3]
+            )
+            successes = torch.norm(des_pos_w - object.data.root_pos_w[env_ids], dim=1) < threshold
+            tracker.record_tscl_episode_outcomes(env_ids, successes)
+            if natural_ids.numel() == 0:
+                return self._last_value
+            natural_successes = successes[~is_curriculum_episode]
+            self._last_value = natural_successes.float().mean()
+        else:
+            if natural_ids.numel() == 0:
+                return self._last_value
+            robot: RigidObject = env.scene[robot_cfg.name]
+            object: RigidObject = env.scene[object_cfg.name]
+            command = env.command_manager.get_command(command_name)
+            des_pos_w, _ = combine_frame_transforms(
+                robot.data.root_pos_w[natural_ids],
+                robot.data.root_quat_w[natural_ids],
+                command[natural_ids, :3],
+            )
+            distance = torch.norm(des_pos_w - object.data.root_pos_w[natural_ids], dim=1)
+            self._last_value = (distance < threshold).float().mean()
         return self._last_value
 
 

@@ -89,6 +89,9 @@ class FactoryEnvCfg(DirectRLEnvCfg):
     ]
 
     reset_state_curriculum_enabled = True
+    # ``aces`` preserves the existing empirical-difficulty scheduler; ``tscl_window`` changes only the
+    # reset-category probabilities while retaining the same empirical states and restoration path.
+    reset_curriculum_mode = "aces"
 
     task_name: str = "peg_insert"  # peg_insert, gear_mesh, nut_thread
     task: FactoryTask = FactoryTask()
@@ -198,6 +201,18 @@ class FactoryEnvCfg(DirectRLEnvCfg):
     greedy_margin = 0.10 # controls the margin between top and second distribution value that enables softmax
     action_std = 0.000 # action noise for curriculum environments
     observation_std = 0.000 # noise added for curriculum environments
+
+    # Shared TSCL-style Window-teacher parameters. The interval is normalized to 100 teacher-update
+    # opportunities over Factory's unchanged 200 rl_games epochs.
+    tscl_history_size = 10
+    tscl_min_history = 5
+    tscl_alpha = 0.1
+    tscl_temperature = 0.0004
+    tscl_min_samples = 8
+    tscl_update_interval_iterations = 2
+    tscl_exploration_fraction = 0.20
+    # Must match the unchanged rl_games horizon_length for Factory.
+    tscl_rollout_steps_per_iteration = 128
 
     # policy params
     curriculum_total_iterations = 200 # rl_games does it differenlty

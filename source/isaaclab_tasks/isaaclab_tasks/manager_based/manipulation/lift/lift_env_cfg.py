@@ -262,6 +262,9 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     # isaaclab_tasks.direct.franka_cabinet.franka_cabinet_env.FrankaCabinetEnvCfg's "custom hyperparameters",
     # kept identical across subtasks rather than retuned per-subtask.
     reset_state_curriculum_enabled = True  # master switch; everything below is a full no-op while this is False
+    # Scheduler selection. ``aces`` preserves the existing empirical-difficulty curriculum unchanged;
+    # ``tscl_window`` changes only the category probabilities and reuses the same state banks/restoration.
+    reset_curriculum_mode = "aces"
     success_buffer_size = 64
     # softmax temperature on the simplex-normalised confidence; lower = sharper soft branch.
     # replaces the old `prob_exp`, which flattened the distribution instead of sharpening it
@@ -276,6 +279,19 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     greedy_margin_lo = 0.5
     greedy_margin_hi = 1.5
     min_subtask_prob = 0.05  # floor on each subtask's sampling probability so none can be starved
+
+    # TSCL-style Window teacher. History length, alpha, temperature, minimum history/sample counts, and
+    # exploration are shared with Cabinet and Factory. The interval is normalized to 100 teacher-update
+    # opportunities over Lift's unchanged 3000 PPO iterations.
+    tscl_history_size = 10
+    tscl_min_history = 5
+    tscl_alpha = 0.1
+    tscl_temperature = 0.0004
+    tscl_min_samples = 8
+    tscl_update_interval_iterations = 30
+    tscl_exploration_fraction = 0.20
+    # Must match the unchanged PPO rollout horizon in both Franka Lift agent configurations.
+    tscl_rollout_steps_per_iteration = 24
 
     def __post_init__(self):
         """Post initialization."""
