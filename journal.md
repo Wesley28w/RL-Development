@@ -16,3 +16,12 @@ All comparisons are **unpaired**: the curriculum consumes additional RNG draws a
 Cliff's d = 2*P(X>Y) - 1. 95% CI is the unpaired bootstrap CI on P(X>Y) (B = 10,000 resamples). Perm. p is an unpaired permutation test on the difference of means (100,000 resamples); B-M p is Brunner-Munzel. \* p < 0.05.
 
 Metric: Cabinet and Lift use the mean of the final 100 iterations; Factory uses each seed's peak over its final 25 logged steps.
+
+Ablations:
+Uniform Random, Absolute Difficulty, Fixed 50/50 Blend, Argmax-only, Softmax-only, No EMA, Sampling Ratio 0.5, and Delay 15%.
+
+Main findings: Ran on training runs + 2000 roll out inference eval
+ERC does well across the board in sucess rate and stability. Stat sig for all
+Compared to TSCL, ERC outperfoms in Cabinet and beats baseline severely. But TSCL and ERC are much closer.
+For lift, they perform similarly, but TSCL seems to do much better in stability with all perfect seeds. No failures. (Though some are like 95 not 99.99)
+For factory, ERC outperforms both TSCL and baseline again. Though marginally.

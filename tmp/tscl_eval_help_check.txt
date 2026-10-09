@@ -1,0 +1,11 @@
+usage: evaluate_rsl_rl.py [-h] --task
+                          {Isaac-Lift-Cube-Franka-v0,Isaac-Franka-Cabinet-Direct-v0}
+                          [--agent AGENT] --train_seed TRAIN_SEED
+                          [--seed SEED] [--num_envs NUM_ENVS]
+                          [--episodes EPISODES] --output_dir OUTPUT_DIR
+                          [--overwrite] [--experiment_name EXPERIMENT_NAME]
+                          [--run_name RUN_NAME] [--resume]
+                          [--load_run LOAD_RUN] [--checkpoint CHECKPOINT]
+                          [--logger {wandb,tensorboard,neptune}]
+                          [--log_project_name LOG_PROJECT_NAME]
+evaluate_rsl_rl.py: error: the following arguments are required: --task, --train_seed, --output_dir

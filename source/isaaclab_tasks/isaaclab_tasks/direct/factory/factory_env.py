@@ -563,9 +563,9 @@ class FactoryEnv(DirectRLEnv):
                     self.pose_buffer_idx[task] = (
                         start + count
                     ) % self.cfg.success_buffer_size
-                self.pose_buffer_count[task] = torch.clamp(
-                    self.pose_buffer_count[task] + count, max=self.cfg.success_buffer_size
-                )
+                    self.pose_buffer_count[task] = torch.clamp(
+                        self.pose_buffer_count[task] + count, max=self.cfg.success_buffer_size
+                    )
 
         if self.tscl_teacher is not None:
             ppo_iteration = self.common_step_counter // self.cfg.tscl_rollout_steps_per_iteration
