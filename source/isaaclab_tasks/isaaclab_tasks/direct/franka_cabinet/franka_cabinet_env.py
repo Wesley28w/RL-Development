@@ -34,8 +34,9 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
 
     # reset state curriculum
     reset_state_curriculum_enabled = False # True
-    # ``aces`` preserves the existing empirical-difficulty scheduler; ``tscl_window`` changes only the
-    # reset-category probabilities while reusing the same state banks and restoration path.
+    # ``aces`` preserves the existing empirical-difficulty scheduler; ``tscl_window`` and
+    # ``uniform_random`` change only the reset-category probabilities while reusing the same state banks and
+    # restoration path.
     reset_curriculum_mode = "aces"
 
     # simulation
@@ -193,6 +194,15 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     # policy params
     curriculum_total_iterations = 2500
 
+
+@configclass
+class FrankaCabinetUniformRandomEnvCfg(FrankaCabinetEnvCfg):
+    """Cabinet uniform-reset ablation with the environment and PPO settings held fixed."""
+
+    reset_state_curriculum_enabled = True
+    reset_curriculum_mode = "uniform_random"
+
+
 class FrankaCabinetEnv(DirectRLEnv):
     # pre-physics step calls
     #   |-- _pre_physics_step(action)
@@ -335,10 +345,10 @@ class FrankaCabinetEnv(DirectRLEnv):
         # The empirical reset category is the TSCL task. The teacher changes only the distribution over
         # these four existing banks; it never changes rewards, observations, dynamics, or PPO data.
         self.tscl_teacher: TSCLWindowTeacher | None = None
-        if self.cfg.reset_curriculum_mode not in {"aces", "tscl_window"}:
+        if self.cfg.reset_curriculum_mode not in {"aces", "tscl_window", "uniform_random"}:
             raise ValueError(
                 f"Unknown reset_curriculum_mode={self.cfg.reset_curriculum_mode!r}; "
-                "expected 'aces' or 'tscl_window'."
+                "expected 'aces', 'tscl_window', or 'uniform_random'."
             )
         if self.cfg.reset_state_curriculum_enabled and self.cfg.reset_curriculum_mode == "tscl_window":
             self.tscl_teacher = TSCLWindowTeacher(
@@ -647,7 +657,13 @@ class FrankaCabinetEnv(DirectRLEnv):
                 L[f"curriculum/distribution_{i+1}"] = (self.distribution[i].item())
             for i in range(4):
                 L[f"curriculum/gap_{i+1}"] = gaps[i].item()
-    
+
+    @staticmethod
+    def _uniform_available_distribution(available_subtasks: torch.Tensor) -> torch.Tensor:
+        """Return equal probability for each populated empirical reset-state bank."""
+        distribution = available_subtasks.to(dtype=torch.float32)
+        return distribution / distribution.sum().clamp(min=1.0)
+
     def _get_rewards(self) -> torch.Tensor:
         # Refresh the intermediate values after the physics steps
         self._compute_intermediate_values()
@@ -658,14 +674,6 @@ class FrankaCabinetEnv(DirectRLEnv):
             (self.cfg.curriculum_total_iterations * 16),
             1.0,
         )
-        # run controller for choosing enable/disable
-        if (
-            self.cfg.reset_state_curriculum_enabled
-            and self.cfg.reset_curriculum_mode == "aces"
-            and self.cfg.controller_enabled
-        ):
-            self._run_curriculum_controller()
-
         # # custom curriclum work
         self._update_progression() # update data each step
         # uses the updated progressions
@@ -676,6 +684,8 @@ class FrankaCabinetEnv(DirectRLEnv):
             if self.tscl_teacher is None:
                 raise RuntimeError("TSCL mode is active but its Window teacher was not initialized.")
             self.distribution = self.tscl_teacher.get_distribution(self.pose_buffer_count > 0)
+        elif self.cfg.reset_state_curriculum_enabled and self.cfg.reset_curriculum_mode == "uniform_random":
+            self.distribution = self._uniform_available_distribution(self.pose_buffer_count > 0)
         else: # keep determinisitc by not messing with the rand generator
             if self.common_step_counter % 10 == 0:
                 self._update_distribution()
@@ -709,8 +719,13 @@ class FrankaCabinetEnv(DirectRLEnv):
             L = self.extras["log"]
             L["reward/total"] = rewards.mean().item()
             L["controller/curriculum_enabled"] = int(self.curriculum_enabled)
-            L["controller/first_snapshot_taken"] = 0 if self.controller_snapshot is None else self.controller_snapshot
-            L["controller/second_snapshot_taken"] = 0 if self.controller_snapshot_two is None else self.controller_snapshot_two
+
+            if self.cfg.reset_state_curriculum_enabled and self.cfg.reset_curriculum_mode == "uniform_random":
+                L["uniform_random/standard_reset_fraction"] = 1.0 - self.cfg.sampling_ratio
+                L["uniform_random/curriculum_reset_fraction"] = self.cfg.sampling_ratio
+                for i in range(4):
+                    L[f"uniform_random/distribution_{i+1}"] = self.distribution[i].item()
+                    L[f"uniform_random/buffer_count_{i+1}"] = self.pose_buffer_count[i].item()
 
         return rewards
 
@@ -770,7 +785,10 @@ class FrankaCabinetEnv(DirectRLEnv):
                 # sample subtasks, restricted to ones that actually have recorded poses. if the distribution
                 # has committed all of its mass to subtasks with no data, fall back to uniform over the ones
                 # that do have data.
-                if self.tscl_teacher is not None:
+                if self.cfg.reset_curriculum_mode == "uniform_random":
+                    masked_distribution = self._uniform_available_distribution(valid_subtasks)
+                    self.distribution = masked_distribution
+                elif self.tscl_teacher is not None:
                     masked_distribution = self.tscl_teacher.get_distribution(valid_subtasks)
                     self.distribution = masked_distribution
                 else:
