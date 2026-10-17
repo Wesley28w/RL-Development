@@ -657,6 +657,7 @@ class FactoryEnv(DirectRLEnv):
                 L = self.extras["log"]
                 L["curriculum/blend"] = 0.0
                 L["curriculum/margin"] = 0.0
+                L["curriculum/margin_norm"] = 0.0
                 L["curriculum/selected"] = -1
                 for i in range(3):
                     L[f"curriculum/success_rate_{i+1}"] = self.success_rate[i].item()
@@ -680,41 +681,50 @@ class FactoryEnv(DirectRLEnv):
         gaps = gaps - gaps.min() # ensure all values are postitive
         gaps = gaps + 1e-8 # if all gaps are equal we don't want all 0s so add tiny value
         
-        # softmax distribution 
-        soft = gaps.pow(
-            self.cfg.prob_exp
-        ).softmax(dim=0)
+        num_subtasks = self.success_rate.numel()
 
-        # confidence
-        confidence = (
-            gaps / gaps.sum().clamp(min=1e-8) # linear norm
-        )
+        # Put the gaps on the simplex before shaping them. This is the corrected ACES soft branch used by
+        # Cabinet and Lift; the former gaps.pow(prob_exp).softmax() formulation was nearly uniform.
+        confidence = gaps / gaps.sum().clamp(min=1e-8)
+        soft = (confidence / self.cfg.softmax_temperature).softmax(dim=0)
 
         top2 = torch.topk(confidence, k=2)
         winner = top2.indices[0] # biggest fr
         margin = (top2.values[0] - top2.values[1]) # difference between biggest and second biggest fr
+        margin_ref = 1.0 / max(num_subtasks - 1, 1)
+        margin_norm = margin / margin_ref
 
         # greedy
         hard = torch.zeros_like(gaps)
         hard[winner] = 1.0
 
-        # blend between the two
-        blend = torch.clamp(margin / self.cfg.greedy_margin, 0.0, 1.0) # elegant: if margin is great than 0.1 then it will be clamped to 1.0. 
-        self.distribution = ((1.0 - blend) * soft + blend * hard)
-        self.distribution /= self.distribution.sum()
-        # self.distribution = soft
+        # Traverse gradually from the soft branch to the greedy branch using the task-count-normalized
+        # confidence margin, matching the corrected Cabinet and Lift implementations.
+        blend = torch.clamp(
+            (margin_norm - self.cfg.greedy_margin_lo)
+            / max(self.cfg.greedy_margin_hi - self.cfg.greedy_margin_lo, 1e-8),
+            0.0,
+            1.0,
+        )
+        distribution = (1.0 - blend) * soft + blend * hard
+
+        # Keep every subtask eligible so the curriculum cannot permanently starve a state bank.
+        eps = self.cfg.min_subtask_prob
+        distribution = (1.0 - eps * num_subtasks) * distribution + eps
+        self.distribution = distribution / distribution.sum()
 
         # for logging
         if hasattr(self, "extras") and "log" in self.extras:
             L = self.extras["log"]
             L["curriculum/blend"] = blend.item()
             L["curriculum/margin"] = margin.item()
+            L["curriculum/margin_norm"] = margin_norm.item()
             L["curriculum/selected"] = winner.item()
-            for i in range(3):
+            for i in range(num_subtasks):
                 L[f"curriculum/success_rate_{i+1}"] = (self.success_rate[i].item())
                 L[f"curriculum/difficulty_{i+1}"] = (difficulty[i].item())
                 L[f"curriculum/distribution_{i+1}"] = (self.distribution[i].item())
-            for i in range(3):
+            for i in range(num_subtasks):
                 L[f"curriculum/gap_{i+1}"] = gaps[i].item()
     
     def _run_curriculum_controller(self):
@@ -783,9 +793,14 @@ class FactoryEnv(DirectRLEnv):
 
         # # custom curriclum work
         self._update_progression() # update data each step
-        # uses the updated progressions
-        if self.cfg.reset_curriculum_mode == "aces" and self.common_step_counter % 10 == 0:
-            self._update_distribution()
+        # Match Cabinet/Lift ACES update timing: stochastic 10% opportunities while replay is active,
+        # deterministic every ten steps while disabled so monitoring remains reproducible and RNG-neutral.
+        if self.cfg.reset_curriculum_mode == "aces":
+            if self.curriculum_enabled:
+                if torch.rand((), device=self.device) < 0.10:
+                    self._update_distribution()
+            elif self.common_step_counter % 10 == 0:
+                self._update_distribution()
 
         # Get successful and failed envs at current timestep
         check_rot = self.cfg_task.name == "nut_thread"

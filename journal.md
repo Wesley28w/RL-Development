@@ -18,7 +18,7 @@ Cliff's d = 2*P(X>Y) - 1. 95% CI is the unpaired bootstrap CI on P(X>Y) (B = 10,
 Metric: Cabinet and Lift use the mean of the final 100 iterations; Factory uses each seed's peak over its final 25 logged steps.
 
 Ablations:
-Uniform Random, Absolute Difficulty, Fixed 50/50 Blend, Argmax-only, Softmax-only, No EMA, Sampling Ratio 0.5, and Delay 15%.
+Uniform Random, Absolute Difficulty, Fixed 50/50 Blend, Argmax-only, Softmax-only, No EMA, Sampling Ratio 0.5, and Delay 15%, buffer size to 1, removed decomposition, include velocities.
 
 Main findings: Ran on training runs + 2000 roll out inference eval
 ERC does well across the board in sucess rate and stability. Stat sig for all

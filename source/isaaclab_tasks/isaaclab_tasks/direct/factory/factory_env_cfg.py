@@ -194,11 +194,16 @@ class FactoryEnvCfg(DirectRLEnvCfg):
 
     # custom hyperparameters
     success_buffer_size = 64
-    prob_exp = 2 # how much we sharpen the probability distribution (1 = No sharpening)
     sampling_ratio = 0.3 # what fraction of resets go to the sample distribution
     curriculum_dr = 0.00 # how much domain randomization to apply to robot joints
     success_rate_alpha = 0.05 # momentum control of success rate movement (pre-calculations)
-    greedy_margin = 0.10 # controls the margin between top and second distribution value that enables softmax
+    # ACES soft branch: normalize the gap vector first, then apply temperature. Lower is sharper.
+    softmax_temperature = 0.25
+    # ACES blend band in units of the uninformative margin 1/(num_subtasks-1).
+    greedy_margin_lo = 0.5
+    greedy_margin_hi = 1.5
+    # Prevent any populated curriculum category from being permanently starved.
+    min_subtask_prob = 0.05
     action_std = 0.000 # action noise for curriculum environments
     observation_std = 0.000 # noise added for curriculum environments
 
