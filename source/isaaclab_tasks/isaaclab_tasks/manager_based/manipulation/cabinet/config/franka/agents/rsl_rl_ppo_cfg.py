@@ -11,7 +11,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 @configclass
 class CabinetPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 96
-    max_iterations = 400
+    max_iterations = 1250
     save_interval = 50
     experiment_name = "franka_open_drawer"
     policy = RslRlPpoActorCriticCfg(

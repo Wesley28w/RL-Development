@@ -188,25 +188,22 @@ class EventCfg:
         },
     )
 
-    reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
+    # Restore replays before baseline resets; the following terms affect natural episodes only.
+    sample_curriculum_reset_state = EventTerm(
+        func=mdp.sample_curriculum_reset_state,
+        mode="reset",
+        params={"tracker_term_name": "subtask_progression_tracker"},
+    )
+
+    reset_all = EventTerm(func=mdp.reset_scene_to_default_natural, mode="reset")
 
     reset_robot_joints = EventTerm(
-        func=mdp.reset_joints_by_offset,
+        func=mdp.reset_joints_by_offset_natural,
         mode="reset",
         params={
             "position_range": (-0.1, 0.1),
             "velocity_range": (0.0, 0.0),
         },
-    )
-
-    # Reset-pose curriculum: for a sampled fraction of resets, overwrites the default reset above with a
-    # replayed subtask state (see mdp/events.py). Must be registered *last* in this class so its writes are
-    # the ones that stick. Gated by `reset_state_curriculum_enabled` (True by default below); setting that
-    # to False makes this a complete no-op -- it doesn't even draw from the random generator.
-    sample_curriculum_reset_state = EventTerm(
-        func=mdp.sample_curriculum_reset_state,
-        mode="reset",
-        params={"tracker_term_name": "subtask_progression_tracker"},
     )
 
 
@@ -312,7 +309,7 @@ class CabinetEnvCfg(ManagerBasedRLEnvCfg):
     """Configuration for the cabinet environment."""
 
     # Scene settings
-    scene: CabinetSceneCfg = CabinetSceneCfg(num_envs=4096, env_spacing=2.0)
+    scene: CabinetSceneCfg = CabinetSceneCfg(num_envs=8192, env_spacing=2.0)
     # Basic settings
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
@@ -327,7 +324,6 @@ class CabinetEnvCfg(ManagerBasedRLEnvCfg):
     success_buffer_size = 64
     prob_exp = 2  # how much we sharpen the probability distribution (1 = no sharpening)
     sampling_ratio = 0.3  # what fraction of resets go to the sampled (curriculum) distribution
-    curriculum_dr = 0.02  # how much domain randomization to apply to replayed robot joints
     success_rate_alpha = 0.05  # momentum control of success rate movement (pre-calculations)
     greedy_margin = 0.10  # controls the margin between top and second distribution value that enables softmax
 

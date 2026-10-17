@@ -14,7 +14,9 @@ from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.utils.math import axis_angle_from_quat, sample_uniform
+from isaaclab.utils.math import axis_angle_from_quat
+
+from isaaclab_tasks.utils.reset_buffer import available_reset_targets, sample_reset_worlds
 from isaaclab_tasks.utils.tscl_window import TSCLWindowTeacher
 
 from . import factory_control, factory_utils
@@ -258,8 +260,6 @@ class FactoryEnv(DirectRLEnv):
 
         obs_tensors = factory_utils.collapse_obs_dict(obs_dict, self.cfg.obs_order + ["prev_actions"])
         state_tensors = factory_utils.collapse_obs_dict(state_dict, self.cfg.state_order + ["prev_actions"])
-        if self.curriculum_enabled and self.cfg.observation_std > 0:
-            obs_tensors = obs_tensors + torch.randn_like(obs_tensors) * self.cfg.observation_std
         return {"policy": obs_tensors, "critic": state_tensors}
 
     def _reset_buffers(self, env_ids):
@@ -274,8 +274,6 @@ class FactoryEnv(DirectRLEnv):
             self._reset_buffers(env_ids)
 
         action = action.clone().to(self.device)
-        if self.curriculum_enabled and self.cfg.action_std > 0:
-            action = action + torch.randn_like(action) * self.cfg.action_std
         self.actions = self.ema_factor * action + (1 - self.ema_factor) * self.actions
 
     def close_gripper_in_place(self):
@@ -777,10 +775,10 @@ class FactoryEnv(DirectRLEnv):
     def _get_rewards(self):
         """Update rewards and compute success statistics."""
 
-        # update progress TODO: compute properly
+        # rl-games iterations contain horizon_length control steps (128 for Factory).
         self.progress = min(
             self.common_step_counter /
-            (self.cfg.curriculum_total_iterations * 16),
+            (self.cfg.curriculum_total_iterations * self.cfg.tscl_rollout_steps_per_iteration),
             1.0,
         )
         # run controller for choosing enable/disable
@@ -916,9 +914,11 @@ class FactoryEnv(DirectRLEnv):
         self._set_franka_to_default_pose(joints=robot_pose, env_ids=env_ids)
         self.step_sim_no_action()
 
-        self.randomize_initial_state(env_ids)
-
-        if (self.curriculum_enabled):
+        self.is_curriculum_episode[env_ids] = False
+        self.curriculum_subtask[env_ids] = -1
+        picked = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
+        worlds = self.success_buffer.new_empty((0, self.success_buffer.shape[-1]))
+        if self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled:
             # force X% of envrionments to be non curriculum (evals instead)
             sample_ratio = self.cfg.sampling_ratio
 
@@ -926,20 +926,15 @@ class FactoryEnv(DirectRLEnv):
 
             perm = torch.randperm(len(env_ids), device=self.device)
 
-            picked = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
             picked[perm[:num_curriculum]] = True
 
-            # subtasks with no recorded successes yet still hold their zero-init buffer
-            # rows (e.g. an all-zero quaternion), which is not a valid pose to replay
-            valid_subtasks = self.pose_buffer_count > 0
+            # Difficulty category i requires bank i-1; category zero uses the normal reset.
+            # TSCL categories continue to identify reset banks directly.
+            valid_subtasks = available_reset_targets(
+                self.pose_buffer_count, use_predecessor=self.tscl_teacher is None
+            )
             if not valid_subtasks.any():
                 picked[:] = False
-
-            # update what episodes are actively using the curriculum
-            self.is_curriculum_episode[env_ids] = False
-            self.is_curriculum_episode[env_ids[picked]] = True
-
-            self.curriculum_subtask[env_ids] = -1
 
             if picked.any():
                 picked_env_ids = env_ids[picked]
@@ -970,36 +965,41 @@ class FactoryEnv(DirectRLEnv):
                 if self.tscl_teacher is not None:
                     self.tscl_teacher.record_reset_draws(subtasks)
 
-                # sample stored worlds (env-local poses; buffer is shared across envs),
-                # clamped to the slots that have actually been written for that subtask
-                max_valid = self.pose_buffer_count[subtasks].clamp(min=1)
-                world_ids = (torch.rand(int(picked.sum().item()), device=self.device) * max_valid.float()).long()
-                world_ids = world_ids.clamp(max=self.cfg.success_buffer_size - 1)
-                worlds = self.success_buffer[subtasks, world_ids]
-
-                curriculum_robot_pose = worlds[:, :9]
-                # optional domain randomization
-                curriculum_robot_pose = curriculum_robot_pose + sample_uniform(
-                    -self.cfg.curriculum_dr,
-                    self.cfg.curriculum_dr,
-                    curriculum_robot_pose.shape,
-                    self.device,
+                replay, worlds = sample_reset_worlds(
+                    self.success_buffer, self.pose_buffer_count, subtasks,
+                    use_predecessor=self.tscl_teacher is None,
                 )
-                robot_pose[picked] = curriculum_robot_pose
+                self.is_curriculum_episode[picked_env_ids] = replay
+                picked[picked.clone()] = replay
 
-                # build fresh (un-offset) default root states so env_origins is only added once below
-                curriculum_held_state = self._held_asset.data.default_root_state.clone()[picked_env_ids]
-                curriculum_held_state[:, 0:7] = worlds[:, 9:16]
-                curriculum_fixed_state = self._fixed_asset.data.default_root_state.clone()[picked_env_ids]
-                curriculum_fixed_state[:, 0:7] = worlds[:, 16:23]
-
-                # only overwrite the curriculum-chosen environments; the rest keep the
-                # domain-randomized/grasped state that randomize_initial_state() set up above
-                self._set_assets_to_default_pose(
-                    env_ids=picked_env_ids, held_state=curriculum_held_state, fixed_state=curriculum_fixed_state
-                )
-                self._set_franka_to_default_pose(joints=curriculum_robot_pose, env_ids=picked_env_ids)
-            
+        # Original baseline randomization belongs only to natural/default-reset episodes.
+        # Replays are restored afterwards because Factory's reset IK steps the shared simulation.
+        natural_ids = env_ids[~picked]
+        if natural_ids.numel() > 0:
+            self.randomize_initial_state(natural_ids)
+        if picked.any():
+            picked_env_ids = env_ids[picked]
+            curriculum_robot_pose = worlds[:, :9]
+            robot_pose[picked] = curriculum_robot_pose
+            curriculum_held_state = self._held_asset.data.default_root_state.clone()[picked_env_ids]
+            curriculum_held_state[:, 0:7] = worlds[:, 9:16]
+            curriculum_fixed_state = self._fixed_asset.data.default_root_state.clone()[picked_env_ids]
+            curriculum_fixed_state[:, 0:7] = worlds[:, 16:23]
+            self._set_assets_to_default_pose(
+                env_ids=picked_env_ids, held_state=curriculum_held_state, fixed_state=curriculum_fixed_state
+            )
+            self._set_franka_to_default_pose(joints=curriculum_robot_pose, env_ids=picked_env_ids)
+            # No baseline sensor offset or curriculum-added noise on replay episodes.
+            self.init_fixed_pos_obs_noise[picked_env_ids] = 0.0
+            self._refresh_fixed_asset_observation_frame()
+            # Teleportation must not appear as motion in the next finite-difference observation.
+            self.prev_joint_pos[picked_env_ids] = self.joint_pos[picked_env_ids, :7]
+            self.prev_fingertip_pos[picked_env_ids] = self.fingertip_midpoint_pos[picked_env_ids]
+            self.prev_fingertip_quat[picked_env_ids] = self.fingertip_midpoint_quat[picked_env_ids]
+            self.ee_angvel_fd[picked_env_ids] = 0.0
+            self.ee_linvel_fd[picked_env_ids] = 0.0
+            self.actions[picked_env_ids] = 0.0
+            self.prev_actions[picked_env_ids] = 0.0
         
         if hasattr(self, "extras") and "log" in self.extras:
             variance = (robot_pose - self._robot.data.default_joint_pos[env_ids]).pow(2).mean() # mean squared difference
@@ -1010,7 +1010,7 @@ class FactoryEnv(DirectRLEnv):
             L["curriculum/reset_distance"] = distance.mean().item()
             L["curriculum/reset_variance"] = variance.item()
             L["curriculum/natural"] = self.is_curriculum_episode.float().mean()
-            if self.curriculum_enabled:
+            if self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled:
                 L["curriculum/sample_rate"] = picked.float().mean().item() # make sure we are sampling correct ratio
                 L["curriculum/sample_ratio_target"] = sample_ratio
 
@@ -1139,8 +1139,25 @@ class FactoryEnv(DirectRLEnv):
         self.scene.update(dt=self.physics_dt)
         self._compute_intermediate_values(dt=self.physics_dt)
 
+    def _refresh_fixed_asset_observation_frame(self):
+        """Refresh the task's observation/action reference after a normal reset or replay."""
+        fixed_tip_pos_local = torch.zeros((self.num_envs, 3), device=self.device)
+        fixed_tip_pos_local[:, 2] += self.cfg_task.fixed_asset_cfg.height
+        fixed_tip_pos_local[:, 2] += self.cfg_task.fixed_asset_cfg.base_height
+        if self.cfg_task.name == "gear_mesh":
+            fixed_tip_pos_local[:, 0] = self.cfg_task.fixed_asset_cfg.medium_gear_base_offset[0]
+        _, fixed_tip_pos = torch_utils.tf_combine(
+            self.fixed_quat, self.fixed_pos,
+            torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1),
+            fixed_tip_pos_local,
+        )
+        self.fixed_pos_obs_frame[:] = fixed_tip_pos
+        return fixed_tip_pos
+
     def randomize_initial_state(self, env_ids):
-        """Randomize initial state and perform any episode-level randomization."""
+        """Apply the original baseline reset randomization to natural episodes only."""
+        if len(env_ids) == 0:
+            return
         # Disable gravity.
         physics_sim_view = sim_utils.SimulationContext.instance().physics_sim_view
         physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, 0.0))
@@ -1176,25 +1193,11 @@ class FactoryEnv(DirectRLEnv):
         fixed_asset_pos_noise = torch.randn((len(env_ids), 3), dtype=torch.float32, device=self.device)
         fixed_asset_pos_rand = torch.tensor(self.cfg.obs_rand.fixed_asset_pos, dtype=torch.float32, device=self.device)
         fixed_asset_pos_noise = fixed_asset_pos_noise @ torch.diag(fixed_asset_pos_rand)
-        self.init_fixed_pos_obs_noise[:] = fixed_asset_pos_noise
+        self.init_fixed_pos_obs_noise[env_ids] = fixed_asset_pos_noise
 
         self.step_sim_no_action()
 
-        # Compute the frame on the bolt that would be used as observation: fixed_pos_obs_frame
-        # For example, the tip of the bolt can be used as the observation frame
-        fixed_tip_pos_local = torch.zeros((self.num_envs, 3), device=self.device)
-        fixed_tip_pos_local[:, 2] += self.cfg_task.fixed_asset_cfg.height
-        fixed_tip_pos_local[:, 2] += self.cfg_task.fixed_asset_cfg.base_height
-        if self.cfg_task.name == "gear_mesh":
-            fixed_tip_pos_local[:, 0] = self.cfg_task.fixed_asset_cfg.medium_gear_base_offset[0]
-
-        _, fixed_tip_pos = torch_utils.tf_combine(
-            self.fixed_quat,
-            self.fixed_pos,
-            torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1),
-            fixed_tip_pos_local,
-        )
-        self.fixed_pos_obs_frame[:] = fixed_tip_pos
+        fixed_tip_pos = self._refresh_fixed_asset_observation_frame()
 
         # (2) Move gripper to randomizes location above fixed asset. Keep trying until IK succeeds.
         # (a) get position vector to target
@@ -1288,13 +1291,14 @@ class FactoryEnv(DirectRLEnv):
         )
 
         # Add asset in hand randomization
-        rand_sample = torch.rand((self.num_envs, 3), dtype=torch.float32, device=self.device)
-        held_asset_pos_noise = 2 * (rand_sample - 0.5)  # [-1, 1]
+        rand_sample = torch.rand((len(env_ids), 3), dtype=torch.float32, device=self.device)
+        selected_pos_noise = 2 * (rand_sample - 0.5)  # [-1, 1]
         if self.cfg_task.name == "gear_mesh":
-            held_asset_pos_noise[:, 2] = -rand_sample[:, 2]  # [-1, 0]
+            selected_pos_noise[:, 2] = -rand_sample[:, 2]  # [-1, 0]
 
         held_asset_pos_noise_level = torch.tensor(self.cfg_task.held_asset_pos_noise, device=self.device)
-        held_asset_pos_noise = held_asset_pos_noise @ torch.diag(held_asset_pos_noise_level)
+        held_asset_pos_noise = torch.zeros((self.num_envs, 3), device=self.device)
+        held_asset_pos_noise[env_ids] = selected_pos_noise @ torch.diag(held_asset_pos_noise_level)
         translated_held_asset_quat, translated_held_asset_pos = torch_utils.tf_combine(
             q1=translated_held_asset_quat,
             t1=translated_held_asset_pos,
@@ -1306,8 +1310,8 @@ class FactoryEnv(DirectRLEnv):
         held_state[:, 0:3] = translated_held_asset_pos + self.scene.env_origins
         held_state[:, 3:7] = translated_held_asset_quat
         held_state[:, 7:] = 0.0
-        self._held_asset.write_root_pose_to_sim(held_state[:, 0:7])
-        self._held_asset.write_root_velocity_to_sim(held_state[:, 7:])
+        self._held_asset.write_root_pose_to_sim(held_state[env_ids, 0:7], env_ids=env_ids)
+        self._held_asset.write_root_velocity_to_sim(held_state[env_ids, 7:], env_ids=env_ids)
         self._held_asset.reset()
 
         #  Close hand

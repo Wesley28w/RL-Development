@@ -121,7 +121,7 @@ class FactoryEnvCfg(DirectRLEnvCfg):
         ),
     )
 
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=128, env_spacing=2.0, clone_in_fabric=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=256, env_spacing=2.0, clone_in_fabric=True)
 
     robot = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
@@ -195,7 +195,6 @@ class FactoryEnvCfg(DirectRLEnvCfg):
     # custom hyperparameters
     success_buffer_size = 64
     sampling_ratio = 0.3 # what fraction of resets go to the sample distribution
-    curriculum_dr = 0.00 # how much domain randomization to apply to robot joints
     success_rate_alpha = 0.05 # momentum control of success rate movement (pre-calculations)
     # ACES soft branch: normalize the gap vector first, then apply temperature. Lower is sharper.
     softmax_temperature = 0.25
@@ -204,11 +203,8 @@ class FactoryEnvCfg(DirectRLEnvCfg):
     greedy_margin_hi = 1.5
     # Prevent any populated curriculum category from being permanently starved.
     min_subtask_prob = 0.05
-    action_std = 0.000 # action noise for curriculum environments
-    observation_std = 0.000 # noise added for curriculum environments
 
-    # Shared TSCL-style Window-teacher parameters. The interval is normalized to 100 teacher-update
-    # opportunities over Factory's unchanged 200 rl_games epochs.
+    # Shared TSCL-style Window-teacher parameters; retain the existing update cadence.
     tscl_history_size = 10
     tscl_min_history = 5
     tscl_alpha = 0.1
@@ -220,7 +216,7 @@ class FactoryEnvCfg(DirectRLEnvCfg):
     tscl_rollout_steps_per_iteration = 128
 
     # policy params
-    curriculum_total_iterations = 200 # rl_games does it differenlty
+    curriculum_total_iterations = 150
     controller_enabled = False
     window_analysis_size = 0.02 # percent to look at
     window_analysis_start = 0.01 # percent to start at

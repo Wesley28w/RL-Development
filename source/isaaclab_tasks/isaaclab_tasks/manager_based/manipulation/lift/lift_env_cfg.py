@@ -118,27 +118,23 @@ class ObservationsCfg:
 class EventCfg:
     """Configuration for events."""
 
-    reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
+    # Plan and restore replays first; baseline reset terms below exclude those episodes.
+    sample_curriculum_reset_state = EventTerm(
+        func=mdp.sample_curriculum_reset_state,
+        mode="reset",
+        params={"tracker_term_name": "subtask_progression_tracker"},
+    )
+
+    reset_all = EventTerm(func=mdp.reset_scene_to_default_natural, mode="reset")
 
     reset_object_position = EventTerm(
-        func=mdp.reset_root_state_uniform,
+        func=mdp.reset_root_state_uniform_natural,
         mode="reset",
         params={
             "pose_range": {"x": (-0.1, 0.1), "y": (-0.25, 0.25), "z": (0.0, 0.0)},
             "velocity_range": {},
             "asset_cfg": SceneEntityCfg("object", body_names="Object"),
         },
-    )
-
-    # reset-pose curriculum (see mdp/events.py for the full explanation, including why the tracker that this
-    # depends on is registered as a reward term in RewardsCfg below rather than here as an "interval" event).
-    # Must run *after* reset_all / reset_object_position above so that, for the sampled environments, its
-    # writes are the ones that stick. Gated by `reset_state_curriculum_enabled`; when that is False (the
-    # default) this is a complete no-op -- it doesn't even draw from the random generator.
-    sample_curriculum_reset_state = EventTerm(
-        func=mdp.sample_curriculum_reset_state,
-        mode="reset",
-        params={"tracker_term_name": "subtask_progression_tracker"},
     )
 
 
@@ -271,7 +267,6 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     # (see mdp/events.py's _update_distribution).
     softmax_temperature = 0.25
     sampling_ratio = 0.3  # what fraction of resets go to the sampled (curriculum) distribution
-    curriculum_dr = 0.02  # how much domain randomization to apply to replayed robot joints
     success_rate_alpha = 0.05  # momentum control of success rate movement (pre-calculations)
     # blend band, in units of the uninformative margin 1/(NUM_SUBTASKS-1): below `lo` the scheduler
     # runs fully soft, above `hi` fully greedy, in between it interpolates. replaces the old
@@ -280,9 +275,7 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     greedy_margin_hi = 1.5
     min_subtask_prob = 0.05  # floor on each subtask's sampling probability so none can be starved
 
-    # TSCL-style Window teacher. History length, alpha, temperature, minimum history/sample counts, and
-    # exploration are shared with Cabinet and Factory. The interval is normalized to 100 teacher-update
-    # opportunities over Lift's unchanged 3000 PPO iterations.
+    # TSCL-style Window teacher. Retain the existing update cadence and teacher parameters.
     tscl_history_size = 10
     tscl_min_history = 5
     tscl_alpha = 0.1

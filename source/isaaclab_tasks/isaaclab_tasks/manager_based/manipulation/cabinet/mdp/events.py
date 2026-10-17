@@ -31,10 +31,10 @@ As with Lift, the curriculum is split across two terms:
   sampling distribution over the four subtasks, weighted towards whichever subtask is currently lagging the
   others the most.
 
-* :func:`sample_curriculum_reset_state` (``EventTermCfg``, mode="reset", must be registered *after* the
-  default reset event terms in ``EventCfg``): for a sampled fraction of the environments being reset,
-  overwrites the default reset that just ran with a world snapshot pulled from the tracker's ring buffer
-  (plus a little domain randomization on the robot joints), teleporting that environment directly into an
+* :func:`sample_curriculum_reset_state` (``EventTermCfg``, mode="reset", registered *before* the
+  natural-only baseline reset terms in ``EventCfg``): for a sampled fraction of the environments being reset,
+  restores a world snapshot pulled from the tracker's ring buffer
+  without perturbing the recorded robot joints, teleporting that environment directly into an
   already-partially-completed state.
 
 Both terms are gated by :attr:`CabinetEnvCfg.reset_state_curriculum_enabled`; each checks it first and
@@ -49,8 +49,11 @@ from typing import TYPE_CHECKING
 import torch
 
 from isaaclab.assets import Articulation
+from isaaclab.envs.mdp import reset_joints_by_offset as _baseline_reset_joints_by_offset
+from isaaclab.envs.mdp import reset_scene_to_default as _baseline_reset_scene_to_default
 from isaaclab.managers import ManagerTermBase, SceneEntityCfg
-from isaaclab.utils.math import sample_uniform
+
+from isaaclab_tasks.utils.reset_buffer import available_reset_targets, natural_reset_ids, sample_reset_worlds
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -188,7 +191,7 @@ class subtask_progression_tracker(ManagerTermBase):
         # add newly-completed worlds to the per-subtask ring buffer -- only from NATURAL episodes.
         # self.progression is cleared for every env at reset, so a curriculum env satisfies the subtask it
         # was teleported into on the first evaluation after the teleport; without this mask it re-deposits
-        # its own start state (plus the curriculum_dr noise) one step after drawing it, and the buffer turns
+        # its own start state one step after drawing it, and the buffer turns
         # into a self-replicating population of its own output rather than a record of what the policy did.
         # A rung-4 teleport also satisfies rung 3 immediately, so one teleport would seed several buffers.
         buffer_completion = new_completion & (~self.is_curriculum_episode).unsqueeze(1)
@@ -345,6 +348,22 @@ class subtask_progression_tracker(ManagerTermBase):
             self._log[f"curriculum/distribution_{i + 1}"] = self.distribution[i].item()
 
 
+def reset_scene_to_default_natural(env, env_ids, reset_joint_targets: bool = False):
+    """Run the original default reset only for episodes not restored from a bank."""
+    env_ids = natural_reset_ids(env, env_ids)
+    if env_ids.numel() > 0:
+        _baseline_reset_scene_to_default(env, env_ids, reset_joint_targets=reset_joint_targets)
+
+
+def reset_joints_by_offset_natural(
+    env, env_ids, position_range, velocity_range, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+):
+    """Preserve baseline joint-reset randomization for natural episodes only."""
+    env_ids = natural_reset_ids(env, env_ids)
+    if env_ids.numel() > 0:
+        _baseline_reset_joints_by_offset(env, env_ids, position_range, velocity_range, asset_cfg)
+
+
 def sample_curriculum_reset_state(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,
@@ -354,9 +373,9 @@ def sample_curriculum_reset_state(
 ) -> None:
     """Overrides the default reset for a sampled fraction of ``env_ids`` with a replayed subtask state.
 
-    Must be registered on ``EventCfg`` *after* the default reset terms (``reset_scene_to_default`` /
-    ``reset_robot_joints``) so that, for the picked environments, this term's writes are the ones that stick.
-    When :attr:`CabinetEnvCfg.reset_state_curriculum_enabled` is False, this is a no-op.
+    Register before the natural-only baseline reset terms. They exclude replayed
+    episodes, preserving recorded poses without joint perturbations or a later
+    default-state overwrite. Disabled curricula retain the original baseline resets.
     """
     # subtask_progression_tracker is registered as a reward term (see the module docstring for why), so it
     # must be looked up through the reward manager rather than the event manager.
@@ -370,12 +389,8 @@ def sample_curriculum_reset_state(
     env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
     picked = torch.rand(len(env_ids), device=env.device) < env.cfg.sampling_ratio
 
-    # a subtask may only be replayed once the policy has actually reached it at least once; until then its
-    # buffer holds all-zero joint positions, and replaying those teleports the arm to a configuration no
-    # rollout ever visited. The difficulty rule concentrates on whichever subtask the policy reaches *least*,
-    # i.e. exactly the one most likely to have an empty buffer, so without this gate the curriculum spends its
-    # budget on garbage states precisely when it can least afford to.
-    valid_subtasks = tracker.pose_buffer_count > 0
+    # Milestone i is practiced from completion bank i-1; target zero keeps the normal reset.
+    valid_subtasks = available_reset_targets(tracker.pose_buffer_count)
     if not valid_subtasks.any():
         # nothing recorded yet anywhere -- leave every environment on its default reset
         tracker.is_curriculum_episode[env_ids] = False
@@ -410,16 +425,19 @@ def sample_curriculum_reset_state(
     subtasks = torch.multinomial(masked_distribution, num_picked, replacement=True)
     tracker.curriculum_subtask[picked_ids] = subtasks
 
-    # draw only from slots that have actually been written for the chosen subtask
-    max_valid = tracker.pose_buffer_count[subtasks].clamp(min=1)
-    world_ids = (torch.rand(num_picked, device=env.device) * max_valid.float()).long()
-    world_ids = world_ids.clamp(max=env.cfg.success_buffer_size - 1)
-    worlds = tracker.success_buffer[subtasks, world_ids]
+    replay, worlds = sample_reset_worlds(tracker.success_buffer, tracker.pose_buffer_count, subtasks)
+    tracker.is_curriculum_episode[picked_ids] = replay
+    picked[picked.clone()] = replay
+    picked_ids = picked_ids[replay]
+    num_picked = picked_ids.numel()
+    if num_picked == 0:
+        tracker._log["curriculum/sample_rate"] = 0.0
+        tracker._log["curriculum/natural"] = tracker.is_curriculum_episode.float().mean().item()
+        tracker._log["curriculum/valid_subtasks"] = valid_subtasks.float().sum().item()
+        return
 
     num_robot_joints = robot.num_joints
-    robot_joint_pos = worlds[:, :num_robot_joints] + sample_uniform(
-        -env.cfg.curriculum_dr, env.cfg.curriculum_dr, (num_picked, num_robot_joints), env.device
-    )
+    robot_joint_pos = worlds[:, :num_robot_joints]
     joint_pos_limits = robot.data.soft_joint_pos_limits[picked_ids]
     robot_joint_pos = torch.clamp(robot_joint_pos, min=joint_pos_limits[..., 0], max=joint_pos_limits[..., 1])
     robot_joint_vel = torch.zeros_like(robot_joint_pos)

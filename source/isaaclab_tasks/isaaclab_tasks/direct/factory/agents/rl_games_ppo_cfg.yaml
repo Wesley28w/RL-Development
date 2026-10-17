@@ -60,7 +60,7 @@ params:
     normalize_input: True
     normalize_value: True
     value_bootstrap: True
-    num_actors: 128
+    num_actors: 256
     reward_shaper:
       scale_value: 1.0
     normalize_advantage: True
@@ -71,7 +71,7 @@ params:
     schedule_type: standard
     kl_threshold: 0.008
     score_to_win: 20000
-    max_epochs: 200
+    max_epochs: 150
     save_best_after: 10
     save_frequency: 100
     print_stats: True

@@ -21,7 +21,10 @@ from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.math import sample_uniform
+
+from isaaclab_tasks.utils.reset_buffer import available_reset_targets, sample_reset_worlds
 from isaaclab_tasks.utils.tscl_window import TSCLWindowTeacher
+
 
 @configclass
 class FrankaCabinetEnvCfg(DirectRLEnvCfg):
@@ -56,7 +59,7 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=4096, env_spacing=3.0, replicate_physics=True, clone_in_fabric=True
+        num_envs=8192, env_spacing=3.0, replicate_physics=True, clone_in_fabric=True
     )
 
     # robot (15 dim pose)
@@ -171,7 +174,6 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     curriculum_store_velocities = False  # control stores joint positions only and resets velocities to zero
     sampling_ratio = 0.3 # what fraction of resets go to the sample distribution
     curriculum_delay_fraction = 0.0  # fraction of training completed before curriculum resets may begin
-    curriculum_dr = 0.02 # how much domain randomization to apply to robot joints
     success_rate_alpha = 0.05 # momentum control of success rate movement (pre-calculations)
     # softmax temperature on the simplex-normalised confidence. lower = sharper soft branch. replaces the
     # old `prob_exp`, which flattened the distribution instead of sharpening it (see _update_distribution)
@@ -183,8 +185,7 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     greedy_margin_hi = 1.5
     min_subtask_prob = 0.05 # floor on each subtask's sampling probability so none can be starved
 
-    # Shared TSCL-style Window-teacher parameters. The interval is normalized to 100 teacher-update
-    # opportunities over Cabinet's unchanged 2500 RSL-RL iterations.
+    # Shared TSCL-style Window-teacher parameters; retain the existing update cadence.
     tscl_history_size = 10
     tscl_min_history = 5
     tscl_alpha = 0.1
@@ -196,7 +197,7 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     tscl_rollout_steps_per_iteration = 16
     
     # policy params
-    curriculum_total_iterations = 2500
+    curriculum_total_iterations = 1250
 
 
 @configclass
@@ -598,7 +599,7 @@ class FrankaCabinetEnv(DirectRLEnv):
         # add successful worlds to buffer (sliding).
         # ONLY natural episodes may contribute. self.progression is zeroed for every env at reset, so a
         # curriculum env satisfies the rung it was teleported into on the very first evaluation after the
-        # teleport -- without this mask it re-deposits its own start state (plus the curriculum_dr noise)
+        # teleport -- without this mask it re-deposits its own start state
         # one physics step after drawing it, and the buffer becomes a self-replicating population of its
         # own output. A rung-4 teleport also satisfies rung 3 (drawer > 0.20) and usually rungs 1-2 (the
         # gripper is still on the handle), so one teleport would seed up to four buffers with the same
@@ -806,9 +807,12 @@ class FrankaCabinetEnv(DirectRLEnv):
             for i in range(num_subtasks):
                 L[f"{log_prefix}/gap_{i+1}"] = gaps[i].item()
 
+    def _available_curriculum_targets(self) -> torch.Tensor:
+        return available_reset_targets(self.pose_buffer_count, use_predecessor=self.tscl_teacher is None)
+
     @staticmethod
     def _uniform_available_distribution(available_subtasks: torch.Tensor) -> torch.Tensor:
-        """Return equal probability for each populated empirical reset-state bank."""
+        """Return equal probability for each available reset target."""
         distribution = available_subtasks.to(dtype=torch.float32)
         return distribution / distribution.sum().clamp(min=1.0)
 
@@ -816,7 +820,7 @@ class FrankaCabinetEnv(DirectRLEnv):
     def _absolute_difficulty_distribution(
         success_rates: torch.Tensor, available_subtasks: torch.Tensor
     ) -> torch.Tensor:
-        """Normalize failure rates over populated banks, without ranking or nonlinear shaping."""
+        """Normalize failure rates over available targets, without nonlinear shaping."""
         difficulty = (1.0 - success_rates).clamp(0.0, 1.0)
         weighted_difficulty = torch.where(available_subtasks, difficulty, torch.zeros_like(difficulty))
         total_difficulty = weighted_difficulty.sum()
@@ -834,7 +838,7 @@ class FrankaCabinetEnv(DirectRLEnv):
         alpha = self.cfg.success_rate_alpha
         self.success_rate = (1.0 - alpha) * self.success_rate + alpha * batch_success
 
-        available_subtasks = self.pose_buffer_count > 0
+        available_subtasks = self._available_curriculum_targets()
         self.distribution = self._absolute_difficulty_distribution(self.success_rate, available_subtasks)
 
         if hasattr(self, "extras") and "log" in self.extras:
@@ -874,14 +878,14 @@ class FrankaCabinetEnv(DirectRLEnv):
                 raise RuntimeError("TSCL mode is active but its Window teacher was not initialized.")
             self.distribution = self.tscl_teacher.get_distribution(self.pose_buffer_count > 0)
         elif self.cfg.reset_state_curriculum_enabled and self.cfg.reset_curriculum_mode == "uniform_random":
-            self.distribution = self._uniform_available_distribution(self.pose_buffer_count > 0)
+            self.distribution = self._uniform_available_distribution(self._available_curriculum_targets())
         elif self.cfg.reset_state_curriculum_enabled and self.cfg.reset_curriculum_mode == "absolute_difficulty":
             # Preserve ACES's success-rate EMA and update cadence; replace only its bottleneck scheduler.
             if torch.rand((), device=self.device) < 0.10:
                 self._update_absolute_difficulty_distribution()
             # Keep the maintained/logged vector masked when bank availability changes between EMA updates.
             self.distribution = self._absolute_difficulty_distribution(
-                self.success_rate, self.pose_buffer_count > 0
+                self.success_rate, self._available_curriculum_targets()
             )
         elif self.cfg.reset_state_curriculum_enabled and self.cfg.reset_curriculum_mode == "fixed_50_50_blend":
             if torch.rand((), device=self.device) < 0.10:
@@ -953,7 +957,7 @@ class FrankaCabinetEnv(DirectRLEnv):
                 L["fixed_50_50_blend/standard_reset_fraction"] = 1.0 - self.cfg.sampling_ratio
                 L["fixed_50_50_blend/curriculum_reset_fraction"] = self.cfg.sampling_ratio
                 L["fixed_50_50_blend/blend"] = 0.5
-                valid_subtasks = self.pose_buffer_count > 0
+                valid_subtasks = self._available_curriculum_targets()
                 effective_distribution = torch.where(
                     valid_subtasks, self.distribution, torch.zeros_like(self.distribution)
                 )
@@ -966,7 +970,7 @@ class FrankaCabinetEnv(DirectRLEnv):
                 L["argmax_only/standard_reset_fraction"] = 1.0 - self.cfg.sampling_ratio
                 L["argmax_only/curriculum_reset_fraction"] = self.cfg.sampling_ratio
                 L["argmax_only/blend"] = 1.0
-                valid_subtasks = self.pose_buffer_count > 0
+                valid_subtasks = self._available_curriculum_targets()
                 effective_distribution = torch.where(
                     valid_subtasks, self.distribution, torch.zeros_like(self.distribution)
                 )
@@ -979,7 +983,7 @@ class FrankaCabinetEnv(DirectRLEnv):
                 L["softmax_only/standard_reset_fraction"] = 1.0 - self.cfg.sampling_ratio
                 L["softmax_only/curriculum_reset_fraction"] = self.cfg.sampling_ratio
                 L["softmax_only/blend"] = 0.0
-                valid_subtasks = self.pose_buffer_count > 0
+                valid_subtasks = self._available_curriculum_targets()
                 effective_distribution = torch.where(
                     valid_subtasks, self.distribution, torch.zeros_like(self.distribution)
                 )
@@ -992,7 +996,7 @@ class FrankaCabinetEnv(DirectRLEnv):
                 L["no_ema/standard_reset_fraction"] = 1.0 - self.cfg.sampling_ratio
                 L["no_ema/curriculum_reset_fraction"] = self.cfg.sampling_ratio
                 L["no_ema/ema_alpha_effective"] = self.cfg.success_rate_alpha
-                valid_subtasks = self.pose_buffer_count > 0
+                valid_subtasks = self._available_curriculum_targets()
                 effective_distribution = torch.where(
                     valid_subtasks, self.distribution, torch.zeros_like(self.distribution)
                 )
@@ -1020,12 +1024,9 @@ class FrankaCabinetEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
 
         # robot state
-        robot_joint_pos = self._robot.data.default_joint_pos[env_ids] + sample_uniform(
-            -0.125,
-            0.125,
-            (len(env_ids), self._robot.num_joints),
-            self.device,
-        )
+        robot_joint_pos = self._robot.data.default_joint_pos[env_ids].clone()
+        self.is_curriculum_episode[env_ids] = False
+        self.curriculum_subtask[env_ids] = -1
 
         # cabinet state
         cabinet = torch.zeros((len(env_ids), self._cabinet.num_joints), device=self.device)
@@ -1052,8 +1053,9 @@ class FrankaCabinetEnv(DirectRLEnv):
             picked = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
             picked[perm[:num_curriculum]] = True
 
-            # only subtasks the policy has actually reached may be replayed (see pose_buffer_count)
-            valid_subtasks = self.pose_buffer_count > 0
+            # ACES targets milestone i from bank i-1; target zero keeps the normal reset.
+            # TSCL categories already identify reset banks directly.
+            valid_subtasks = self._available_curriculum_targets()
             if not valid_subtasks.any():
                 picked[:] = False
 
@@ -1091,14 +1093,14 @@ class FrankaCabinetEnv(DirectRLEnv):
                 if self.tscl_teacher is not None:
                     self.tscl_teacher.record_reset_draws(subtasks)
 
-                # sample stored worlds, clamped to the slots that have actually been written for that subtask
-                max_valid = self.pose_buffer_count[subtasks].clamp(min=1)
-                world_ids = (
-                    torch.rand(int(picked.sum().item()), device=self.device) * max_valid.float()
-                ).long()
-                world_ids = world_ids.clamp(max=self.cfg.success_buffer_size - 1)
-
-                worlds = self.success_buffer[subtasks, world_ids]
+                replay, worlds = sample_reset_worlds(
+                    self.success_buffer, self.pose_buffer_count, subtasks,
+                    use_predecessor=self.tscl_teacher is None,
+                )
+                picked_ids = env_ids[picked]
+                self.is_curriculum_episode[picked_ids] = replay
+                # A first-milestone target is a natural reset, not a replayed episode.
+                picked[picked.clone()] = replay
 
                 # overwrite default reset with curriculum reset
                 robot_pos_end = self._robot.num_joints
@@ -1112,13 +1114,12 @@ class FrankaCabinetEnv(DirectRLEnv):
                     joint_vel[picked] = worlds[:, cabinet_pos_end:robot_vel_end]
                     cabinet_joint_vel[picked] = worlds[:, robot_vel_end:cabinet_vel_end]
 
-                # optional domain randomization
-                robot_joint_pos[picked] += sample_uniform(
-                    -self.cfg.curriculum_dr,
-                    self.cfg.curriculum_dr,
-                    robot_joint_pos[picked].shape,
-                    self.device,
-                )
+        # Preserve the original baseline joint-reset noise only for natural episodes.
+        natural = ~self.is_curriculum_episode[env_ids]
+        if natural.any():
+            robot_joint_pos[natural] += sample_uniform(
+                -0.125, 0.125, (int(natural.sum().item()), self._robot.num_joints), self.device
+            )
 
         # reset progression buffer of all environments reset
         self.progression[env_ids] = 0 # set back to incomplete
@@ -1154,10 +1155,10 @@ class FrankaCabinetEnv(DirectRLEnv):
                 L["velocity_world/state_dimension"] = self.curriculum_world_dim
                 L["velocity_world/robot_joint_speed_mean"] = joint_vel.norm(dim=1).mean().item()
                 L["velocity_world/cabinet_joint_speed_mean"] = cabinet_joint_vel.norm(dim=1).mean().item()
-            if self.curriculum_enabled:
+            if self.cfg.reset_state_curriculum_enabled and self.curriculum_enabled:
                 L["curriculum/sample_rate"] = picked.float().mean().item() # make sure we are sampling correct ratio
                 L["curriculum/sample_ratio_target"] = sample_ratio
-                L["curriculum/valid_subtasks"] = self.pose_buffer_count.gt(0).float().sum().item()
+                L["curriculum/valid_subtasks"] = valid_subtasks.float().sum().item()
                 for i in range(self.num_curriculum_subtasks):
                     L[f"curriculum/buffer_fill_{i+1}"] = self.pose_buffer_count[i].item()
 
