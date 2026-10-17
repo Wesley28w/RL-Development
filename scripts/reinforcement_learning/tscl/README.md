@@ -1,5 +1,36 @@
 # TSCL fixed-checkpoint evaluation
 
+## Sixteen-seed training campaign
+
+The canonical all-task launcher uses seeds 42--57 and always writes below `logs/journal/training/`. `train_all.ps1`
+runs Cabinet first (16,384 environments, 1,500 iterations), Lift second (4,096 environments, 1,500 iterations), and
+Factory last (512 environments, 75 iterations). Cabinet includes Baseline, ERC, TSCL, and every supported ERC
+ablation; Lift and Factory run the matched Baseline/ERC/TSCL trio because the ablation task registrations are
+Cabinet-specific. Completed runs are skipped, while partial or ambiguous runs stop the launcher so they cannot be
+silently mixed with a replacement. Output method directories include their environment and iteration budgets.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/reinforcement_learning/tscl/train_all.ps1
+powershell -ExecutionPolicy Bypass -File scripts/reinforcement_learning/tscl/train_cabinet.ps1
+powershell -ExecutionPolicy Bypass -File scripts/reinforcement_learning/tscl/train_lift.ps1
+powershell -ExecutionPolicy Bypass -File scripts/reinforcement_learning/tscl/train_factory.ps1
+powershell -ExecutionPolicy Bypass -File scripts/reinforcement_learning/tscl/train_cabinet_ablations.ps1
+```
+
+Add `-DryRun` to inspect all resolved commands without launching Isaac Sim. Individual methods and ablations can be
+selected with `-Methods` and `-Ablations`. Matching Bash wrappers with the same base names are also provided.
+
+The matching evaluation launchers use 10,000 completed episodes per checkpoint, 512 evaluation environments, and
+evaluation seed 12345. Results are written below `logs/journal/evaluations/<task>/<method>/`.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/reinforcement_learning/tscl/evaluate_all.ps1
+powershell -ExecutionPolicy Bypass -File scripts/reinforcement_learning/tscl/evaluate_cabinet.ps1
+powershell -ExecutionPolicy Bypass -File scripts/reinforcement_learning/tscl/evaluate_lift.ps1
+powershell -ExecutionPolicy Bypass -File scripts/reinforcement_learning/tscl/evaluate_factory.ps1
+powershell -ExecutionPolicy Bypass -File scripts/reinforcement_learning/tscl/evaluate_cabinet_ablations.ps1
+```
+
 This directory evaluates the final, fixed-budget checkpoint from every TSCL training seed. Evaluation disables
 reset-state curriculum sampling and uses each task's original reset distribution, reward, observation, termination,
 and success definition. It does not select checkpoints using evaluation performance.
@@ -28,12 +59,12 @@ The launcher reads the organized journal layout directly:
 
 ```text
 logs/journal/
-  cabinet_tscl/<timestamp>_seed_<42-57>/model_2499.pt
-  lift_tscl/<timestamp>_seed_<42-57>/model_2999.pt
-  factory_tscl/tscl_nut_thread_seed_<42-57>/nn/last_Factory_ep_200_rew_*.pth
+  training/cabinet/tscl/<timestamp>_seed_<42-53>/model_1499.pt
+  training/lift/tscl/<timestamp>_seed_<42-53>/model_1499.pt
+  training/factory/tscl/seed_<42-53>/nn/last_Factory_ep_200_rew_*.pth
 ```
 
-Defaults are 10,240 episodes per trained seed, 512 parallel environments, and the same evaluation seed (12345) for
+Defaults are 10,000 episodes per trained seed, 512 parallel environments, and the same evaluation seed (12345) for
 every policy. Per-episode CSV files, per-seed JSON summaries, checkpoint hashes, Wilson 95% intervals, and a combined
 CSV are written below `logs/journal/evaluations/tscl/`, separate from immutable training artifacts. Use `-JournalRoot`
 or `-ResultsRoot` only when intentionally working from a different location; relative paths are resolved from the
@@ -51,7 +82,7 @@ RSL-RL inference is deterministic. Factory preserves its saved RL-Games player s
 ## Matched Baseline and ERC evaluation
 
 Use `evaluate_baseline_erc.ps1` to evaluate the final fixed-budget Baseline and ERC checkpoints with the same protocol
-as TSCL: 10,240 episodes per trained seed, 512 parallel environments, evaluation seed 12345, deterministic RSL-RL
+as TSCL: 10,000 episodes per trained seed, 512 parallel environments, evaluation seed 12345, deterministic RSL-RL
 inference, and the saved stochastic RL-Games Factory player setting. Curriculum reset sampling is disabled, so every
 method is measured from the original task reset distribution.
 
@@ -87,7 +118,7 @@ requires exactly one canonical epoch-200 checkpoint in each run window. It stops
 ## Unified 10,000-episode full benchmark
 
 `evaluate_full_benchmark.ps1` reruns every final Baseline, ERC, and TSCL policy for Lift, Cabinet, and Factory at one
-fixed protocol: seeds 42 through 57, 10,000 completed episodes per checkpoint, 512 parallel environments, and
+fixed protocol: seeds 42 through 53, 10,000 completed episodes per checkpoint, 512 parallel environments, and
 evaluation seed 12345. Results are written only below `logs/journal/full_eval/`, organized by method and task.
 
 Run the full checkpoint and command preflight without launching Isaac Sim:
@@ -102,7 +133,7 @@ Run the complete benchmark sequentially:
 powershell -ExecutionPolicy Bypass -File scripts/reinforcement_learning/tscl/evaluate_full_benchmark.ps1
 ```
 
-The launcher evaluates 144 final policies: three methods, three tasks, and sixteen training seeds. Each policy gets
+The launcher evaluates 108 final policies: three methods, three tasks, and twelve training seeds. Each policy gets
 exactly 10,000 completed episodes. It is resumable: matching completed summaries are skipped on the next invocation.
 Use `-Overwrite` only when deliberately replacing already completed results. `-Methods`, `-Tasks`, and `-Seeds` can
 restrict a run without changing the evaluation protocol.
@@ -110,7 +141,7 @@ restrict a run without changing the evaluation protocol.
 ## Corrected Factory dones/success_rate evaluation
 
 `evaluate_factory_dones.ps1` evaluates only Factory Nut-Thread for Baseline, ERC, and TSCL. By default it evaluates
-seeds 42 through 57 for 2,000 completed episodes per checkpoint, using 512 environments, evaluation seed 12345, the
+seeds 42 through 53 for 2,000 completed episodes per checkpoint, using 512 environments, evaluation seed 12345, the
 original reset distribution, curriculum-disabled resets, and the saved stochastic RL-Games player setting.
 
 ```powershell

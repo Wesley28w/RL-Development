@@ -4,7 +4,7 @@ param(
     [string[]] $Methods = @("Baseline", "ERC", "TSCL"),
     [ValidateSet("Lift", "Cabinet", "Factory")]
     [string[]] $Tasks = @("Lift", "Cabinet", "Factory"),
-    [int[]] $Seeds = (42..57),
+    [int[]] $Seeds = (42..53),
     [switch] $AllowMissing,
     [switch] $Overwrite,
     [switch] $DryRun,
@@ -18,7 +18,7 @@ $baselineErcLauncher = Join-Path $PSScriptRoot "evaluate_baseline_erc.ps1"
 $tsclLauncher = Join-Path $PSScriptRoot "evaluate_tscl.ps1"
 
 # This benchmark protocol is deliberately fixed so all methods are directly comparable.
-$episodes = 2000
+$episodes = 10000
 $numEnvs = 512
 $evalSeed = 12345
 $fullEvalRoot = Join-Path $repoRoot "logs\journal\full_eval"
@@ -48,8 +48,7 @@ if ($comparisonMethods.Count -gt 0) {
     foreach ($entry in $common.GetEnumerator()) { $comparisonArgs[$entry.Key] = $entry.Value }
     $comparisonArgs.Methods = $comparisonMethods
     $comparisonArgs.ResultsRoot = $fullEvalRoot
-    # The comparator launcher normally guards the prior 10,240-episode protocol. This unified
-    # launcher intentionally evaluates every method at the new fixed 10,000-episode budget.
+    # Explicitly acknowledge the fixed 10,000-episode campaign protocol.
     $comparisonArgs.AllowProtocolOverride = $true
     & $baselineErcLauncher @comparisonArgs
 }

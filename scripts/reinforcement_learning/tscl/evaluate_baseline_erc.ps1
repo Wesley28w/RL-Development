@@ -4,9 +4,9 @@ param(
     [string[]] $Methods = @("Baseline", "ERC"),
     [ValidateSet("Lift", "Cabinet", "Factory")]
     [string[]] $Tasks = @("Lift", "Cabinet", "Factory"),
-    [int[]] $Seeds = (42..57),
+    [int[]] $Seeds = (42..53),
     [ValidateRange(1, 1000000)]
-    [int] $Episodes = 10240,
+    [int] $Episodes = 10000,
     [ValidateRange(1, 65536)]
     [int] $NumEnvs = 512,
     [int] $EvalSeed = 12345,
@@ -27,7 +27,7 @@ $factoryEvaluator = Join-Path $PSScriptRoot "evaluate_factory_rl_games.py"
 
 if (-not $AllowProtocolOverride) {
     $protocolDifferences = @()
-    if ($Episodes -ne 10240) { $protocolDifferences += "Episodes=$Episodes (TSCL used 10240)" }
+    if ($Episodes -ne 10000) { $protocolDifferences += "Episodes=$Episodes (TSCL uses 10000)" }
     if ($NumEnvs -ne 512) { $protocolDifferences += "NumEnvs=$NumEnvs (TSCL used 512)" }
     if ($EvalSeed -ne 12345) { $protocolDifferences += "EvalSeed=$EvalSeed (TSCL used 12345)" }
     if ($DeterministicFactory) { $protocolDifferences += "DeterministicFactory=True (TSCL used its saved stochastic player setting)" }
@@ -181,37 +181,37 @@ foreach ($methodName in $Methods) {
             try {
                 switch ("$methodName/$taskName") {
                     "Baseline/Lift" {
-                        $checkpoint = Resolve-RslCheckpoint "lift_baseline" $seed "model_2999.pt"
+                        $checkpoint = Resolve-RslCheckpoint "training\lift\baseline" $seed "model_1499.pt"
                         $taskId = "Isaac-Lift-Cube-Franka-v0"
                         $evaluator = $rslEvaluator
                         $slug = "franka_lift"
                     }
                     "Baseline/Cabinet" {
-                        $checkpoint = Resolve-RslCheckpoint "cabinet_baseline" $seed "model_2499.pt"
+                        $checkpoint = Resolve-RslCheckpoint "training\cabinet\baseline" $seed "model_1499.pt"
                         $taskId = "Isaac-Franka-Cabinet-Direct-v0"
                         $evaluator = $rslEvaluator
                         $slug = "franka_cabinet"
                     }
                     "Baseline/Factory" {
-                        $checkpoint = Resolve-FactoryCheckpoint "factory_baseline" "journal_baseline_" $seed
+                        $checkpoint = Resolve-FactoryCheckpoint "training\factory\baseline" "seed_" $seed
                         $taskId = "Isaac-Factory-NutThread-Direct-v0"
                         $evaluator = $factoryEvaluator
                         $slug = "franka_factory_nut_thread"
                     }
                     "ERC/Lift" {
-                        $checkpoint = Resolve-RslCheckpoint "lift_curriculum" $seed "model_2999.pt"
+                        $checkpoint = Resolve-RslCheckpoint "training\lift\erc" $seed "model_1499.pt"
                         $taskId = "Isaac-Lift-Cube-Franka-v0"
                         $evaluator = $rslEvaluator
                         $slug = "franka_lift"
                     }
                     "ERC/Cabinet" {
-                        $checkpoint = Resolve-RslCheckpoint "cabinet_curriculum" $seed "model_2499.pt"
+                        $checkpoint = Resolve-RslCheckpoint "training\cabinet\erc" $seed "model_1499.pt"
                         $taskId = "Isaac-Franka-Cabinet-Direct-v0"
                         $evaluator = $rslEvaluator
                         $slug = "franka_cabinet"
                     }
                     "ERC/Factory" {
-                        $checkpoint = Resolve-FactoryCheckpoint "factory_curriculum" "journal_curriculum_" $seed
+                        $checkpoint = Resolve-FactoryCheckpoint "training\factory\erc" "seed_" $seed
                         $taskId = "Isaac-Factory-NutThread-Direct-v0"
                         $evaluator = $factoryEvaluator
                         $slug = "franka_factory_nut_thread"

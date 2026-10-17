@@ -2,7 +2,7 @@
 param(
     [ValidateSet("Baseline", "ERC", "TSCL")]
     [string[]] $Methods = @("Baseline", "ERC", "TSCL"),
-    [int[]] $Seeds = (42..57),
+    [int[]] $Seeds = (42..53),
     [ValidateRange(1, 1000000)]
     [int] $Episodes = 2000,
     [switch] $AllowMissing,

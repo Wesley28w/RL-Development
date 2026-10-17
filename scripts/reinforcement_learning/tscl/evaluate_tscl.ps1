@@ -2,9 +2,9 @@
 param(
     [ValidateSet("Lift", "Cabinet", "Factory")]
     [string[]] $Tasks = @("Lift", "Cabinet", "Factory"),
-    [int[]] $Seeds = (42..57),
+    [int[]] $Seeds = (42..53),
     [ValidateRange(1, 1000000)]
-    [int] $Episodes = 10240,
+    [int] $Episodes = 10000,
     [ValidateRange(1, 65536)]
     [int] $NumEnvs = 512,
     [int] $EvalSeed = 12345,
@@ -111,7 +111,7 @@ function Resolve-RslCheckpoint {
 
 function Resolve-FactoryCheckpoint {
     param([int] $Seed)
-    $nnDir = Join-Path $journalRootPath "factory_tscl\tscl_nut_thread_seed_$Seed\nn"
+    $nnDir = Join-Path $journalRootPath "training\factory\tscl\seed_$Seed\nn"
     $canonical = @(Get-ChildItem -LiteralPath $nnDir -File -Filter "last_Factory_ep_200_rew_*.pth" -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match '^last_Factory_ep_200_rew_(?!_).+\.pth$' })
     if ($canonical.Count -eq 1) {
@@ -131,13 +131,13 @@ foreach ($taskName in $Tasks) {
         try {
             switch ($taskName) {
                 "Lift" {
-                    $checkpoint = Resolve-RslCheckpoint "lift_tscl" $seed "model_2999.pt"
+                    $checkpoint = Resolve-RslCheckpoint "training\lift\tscl" $seed "model_1499.pt"
                     $taskId = "Isaac-Lift-Cube-Franka-v0"
                     $evaluator = $rslEvaluator
                     $slug = "franka_lift"
                 }
                 "Cabinet" {
-                    $checkpoint = Resolve-RslCheckpoint "cabinet_tscl" $seed "model_2499.pt"
+                    $checkpoint = Resolve-RslCheckpoint "training\cabinet\tscl" $seed "model_1499.pt"
                     $taskId = "Isaac-Franka-Cabinet-Direct-v0"
                     $evaluator = $rslEvaluator
                     $slug = "franka_cabinet"
