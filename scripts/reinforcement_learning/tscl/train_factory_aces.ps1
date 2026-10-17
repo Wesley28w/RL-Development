@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [int[]] $Seeds = (42..57),
+    [string] $PythonExe = "",
     [switch] $DryRun
 )
 
@@ -15,13 +16,12 @@ $softmaxTemperature = 0.25
 $runPrefix = "aces_nut_thread_512env_200iter_temp_0p25"
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
-$isaacLabBat = Join-Path $repoRoot "isaaclab.bat"
 $trainScript = Join-Path $repoRoot "scripts\reinforcement_learning\rl_games\train.py"
 $factoryCfg = Join-Path $repoRoot "source\isaaclab_tasks\isaaclab_tasks\direct\factory\factory_env_cfg.py"
 $factoryEnv = Join-Path $repoRoot "source\isaaclab_tasks\isaaclab_tasks\direct\factory\factory_env.py"
 $outputRoot = Join-Path $repoRoot "logs\rl_games\Factory"
 
-foreach ($requiredPath in @($isaacLabBat, $trainScript, $factoryCfg, $factoryEnv)) {
+foreach ($requiredPath in @($trainScript, $factoryCfg, $factoryEnv)) {
     if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
         throw "Required file is missing: $requiredPath"
     }
@@ -42,11 +42,52 @@ if ($envText -notmatch 'soft\s*=\s*\(confidence\s*/\s*self\.cfg\.softmax_tempera
     throw "The revised normalized-gap ACES softmax implementation was not found in factory_env.py."
 }
 
+# Calling this script through `powershell -File` can run the user's PowerShell profile in the child
+# process and reactivate Conda base. Resolve an interpreter that can actually import IsaacLab instead
+# of relying on whichever environment isaaclab.bat happens to observe.
+$pythonCandidates = @()
+if ($PythonExe) {
+    $pythonCandidates += $PythonExe
+}
+else {
+    if ($env:CONDA_PREFIX) {
+        $pythonCandidates += (Join-Path $env:CONDA_PREFIX "python.exe")
+    }
+    if ($env:CONDA_EXE) {
+        $condaRoot = Split-Path (Split-Path $env:CONDA_EXE -Parent) -Parent
+        $pythonCandidates += (Join-Path $condaRoot "envs\env_isaaclab\python.exe")
+    }
+    if ($env:USERPROFILE) {
+        $pythonCandidates += (Join-Path $env:USERPROFILE "miniconda3\envs\env_isaaclab\python.exe")
+        $pythonCandidates += (Join-Path $env:USERPROFILE "anaconda3\envs\env_isaaclab\python.exe")
+    }
+    $pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($pythonCommand) {
+        $pythonCandidates += $pythonCommand.Source
+    }
+}
+
+$pythonPath = $null
+foreach ($candidate in @($pythonCandidates | Select-Object -Unique)) {
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        continue
+    }
+    & $candidate -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('isaaclab') and importlib.util.find_spec('rl_games') else 1)"
+    if ($LASTEXITCODE -eq 0) {
+        $pythonPath = (Resolve-Path -LiteralPath $candidate).Path
+        break
+    }
+}
+if (-not $pythonPath) {
+    throw "Could not find a Python interpreter with both isaaclab and rl_games. Pass -PythonExe with the env_isaaclab python.exe path."
+}
+
 Write-Host "[PROTOCOL] Factory Nut-Thread ACES"
 Write-Host "[PROTOCOL] Seeds: 42-57 (16 runs)"
 Write-Host "[PROTOCOL] Environments per run: $numEnvs"
 Write-Host "[PROTOCOL] RL-Games epochs per run: $maxIterations"
 Write-Host "[PROTOCOL] Revised normalized-gap softmax temperature: $softmaxTemperature"
+Write-Host "[PYTHON]   $pythonPath"
 Write-Host "[OUTPUT]   $outputRoot\$runPrefix`_seed_<seed>"
 
 Push-Location $repoRoot
@@ -60,7 +101,6 @@ try {
         }
 
         $arguments = @(
-            "-p",
             $trainScript,
             "--task", $task,
             "--headless",
@@ -78,11 +118,11 @@ try {
         Write-Host ""
         Write-Host "[RUN] Seed $seed -> $runName"
         if ($DryRun) {
-            Write-Host ("& `"{0}`" {1}" -f $isaacLabBat, ($arguments -join " "))
+            Write-Host ("& `"{0}`" {1}" -f $pythonPath, ($arguments -join " "))
             continue
         }
 
-        & $isaacLabBat @arguments
+        & $pythonPath @arguments
         if ($LASTEXITCODE -ne 0) {
             throw "Factory ACES seed $seed failed with exit code $LASTEXITCODE."
         }
