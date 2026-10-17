@@ -59,7 +59,7 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(
-        num_envs=8192, env_spacing=3.0, replicate_physics=True, clone_in_fabric=True
+        num_envs=4096, env_spacing=3.0, replicate_physics=True, clone_in_fabric=True
     )
 
     # robot (15 dim pose)
@@ -185,19 +185,19 @@ class FrankaCabinetEnvCfg(DirectRLEnvCfg):
     greedy_margin_hi = 1.5
     min_subtask_prob = 0.05 # floor on each subtask's sampling probability so none can be starved
 
-    # Shared TSCL-style Window-teacher parameters; retain the existing update cadence.
+    # Shared TSCL-style Window-teacher parameters; 15 iterations gives 100 update opportunities.
     tscl_history_size = 10
     tscl_min_history = 5
     tscl_alpha = 0.1
     tscl_temperature = 0.0004
     tscl_min_samples = 8
-    tscl_update_interval_iterations = 25
+    tscl_update_interval_iterations = 15
     tscl_exploration_fraction = 0.20
     # Must match the unchanged RSL-RL num_steps_per_env for this direct Cabinet benchmark.
     tscl_rollout_steps_per_iteration = 16
     
     # policy params
-    curriculum_total_iterations = 1250
+    curriculum_total_iterations = 1500
 
 
 @configclass

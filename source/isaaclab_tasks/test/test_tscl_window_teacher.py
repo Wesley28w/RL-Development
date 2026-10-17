@@ -56,7 +56,7 @@ def test_updates_only_after_configured_ppo_iteration_interval() -> None:
 
 @pytest.mark.parametrize(
     ("total_iterations", "update_interval"),
-    [(3_000, 30), (2_500, 25), (200, 2)],
+    [(1_500, 15), (1_500, 15), (200, 2)],
 )
 def test_normalized_benchmark_schedule_has_100_updates(total_iterations: int, update_interval: int) -> None:
     teacher = _make_teacher(update_interval_iterations=update_interval)

@@ -121,7 +121,7 @@ class FactoryEnvCfg(DirectRLEnvCfg):
         ),
     )
 
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=256, env_spacing=2.0, clone_in_fabric=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=128, env_spacing=2.0, clone_in_fabric=True)
 
     robot = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
@@ -216,7 +216,7 @@ class FactoryEnvCfg(DirectRLEnvCfg):
     tscl_rollout_steps_per_iteration = 128
 
     # policy params
-    curriculum_total_iterations = 150
+    curriculum_total_iterations = 200
     controller_enabled = False
     window_analysis_size = 0.02 # percent to look at
     window_analysis_start = 0.01 # percent to start at

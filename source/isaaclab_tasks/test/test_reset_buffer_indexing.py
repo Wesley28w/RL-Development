@@ -18,6 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import yaml
 
 TASKS = Path(__file__).resolve().parents[1] / "isaaclab_tasks"
 spec = importlib.util.spec_from_file_location("reset_buffer", TASKS / "utils/reset_buffer.py")
@@ -296,15 +297,20 @@ class TestRuntimeConfigurations(unittest.TestCase):
                 if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in n.targets)
             )
 
-        self.assertEqual(scalar("direct/franka_cabinet/agents/rsl_rl_ppo_cfg.py", "max_iterations"), 1250)
-        self.assertEqual(scalar("direct/franka_cabinet/franka_cabinet_env.py", "curriculum_total_iterations"), 1250)
+        self.assertEqual(scalar("direct/franka_cabinet/agents/rsl_rl_ppo_cfg.py", "max_iterations"), 1500)
+        self.assertEqual(scalar("direct/franka_cabinet/franka_cabinet_env.py", "curriculum_total_iterations"), 1500)
         self.assertEqual(
             scalar("manager_based/manipulation/lift/config/franka/agents/rsl_rl_ppo_cfg.py", "max_iterations"), 1500
         )
-        self.assertEqual(scalar("direct/factory/factory_env_cfg.py", "curriculum_total_iterations"), 150)
+        self.assertEqual(scalar("direct/factory/factory_env_cfg.py", "curriculum_total_iterations"), 200)
+        factory_agent = yaml.safe_load(
+            (TASKS / "direct/factory/agents/rl_games_ppo_cfg.yaml").read_text(encoding="utf-8")
+        )["params"]["config"]
+        self.assertEqual(factory_agent["num_actors"], 128)
+        self.assertEqual(factory_agent["max_epochs"], 200)
         for path, expected in (
-            ("direct/franka_cabinet/franka_cabinet_env.py", 8192),
-            ("direct/factory/factory_env_cfg.py", 256),
+            ("direct/franka_cabinet/franka_cabinet_env.py", 4096),
+            ("direct/factory/factory_env_cfg.py", 128),
             ("manager_based/manipulation/lift/lift_env_cfg.py", 4096),
         ):
             tree = ast.parse((TASKS / path).read_text(encoding="utf-8"))

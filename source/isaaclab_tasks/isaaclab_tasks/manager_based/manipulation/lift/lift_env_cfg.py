@@ -275,13 +275,13 @@ class LiftEnvCfg(ManagerBasedRLEnvCfg):
     greedy_margin_hi = 1.5
     min_subtask_prob = 0.05  # floor on each subtask's sampling probability so none can be starved
 
-    # TSCL-style Window teacher. Retain the existing update cadence and teacher parameters.
+    # TSCL-style Window teacher. Fifteen iterations gives 100 update opportunities.
     tscl_history_size = 10
     tscl_min_history = 5
     tscl_alpha = 0.1
     tscl_temperature = 0.0004
     tscl_min_samples = 8
-    tscl_update_interval_iterations = 30
+    tscl_update_interval_iterations = 15
     tscl_exploration_fraction = 0.20
     # Must match the unchanged PPO rollout horizon in both Franka Lift agent configurations.
     tscl_rollout_steps_per_iteration = 24
